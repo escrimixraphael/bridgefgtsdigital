@@ -21,12 +21,10 @@ app.use(express.json({ limit: '50mb' }))
 // ======================================================
 // CONFIGURAÇÃO
 // ======================================================
-const X_API_KEY = process.env.BRIDGE_API_KEY || 'uma-chave-secreta-bem-longa'
+// Puxa do Render (process.env) ou usa as chaves fornecidas como fallback absoluto
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '9c6c38a65f8052500b7d4c2aff0b87fa'
+const FGTS_API_KEY = process.env.FGTS_API_KEY || '5341b41fa01513c5b3e23f6dc35b8e94'
 const PORT = process.env.PORT || 3000
-
-if (!process.env.BRIDGE_API_KEY) {
-  console.warn('[WARN] BRIDGE_API_KEY não definida em env — usando fallback. Configure no Render!')
-}
 
 // ======================================================
 // SEGURANÇA — Validação de Chave API
@@ -34,17 +32,26 @@ if (!process.env.BRIDGE_API_KEY) {
 function apiKeyValida(recebida) {
   if (!recebida) return false
   try {
-    const a = crypto.createHash('sha256').update(String(recebida)).digest()
-    const b = crypto.createHash('sha256').update(String(X_API_KEY)).digest()
-    return crypto.timingSafeEqual(a, b)
+    const hashRecebido = crypto.createHash('sha256').update(String(recebida)).digest()
+    const hashBridge = crypto.createHash('sha256').update(String(BRIDGE_API_KEY)).digest()
+    const hashFgts = crypto.createHash('sha256').update(String(FGTS_API_KEY)).digest()
+    
+    // Libera o acesso se bater com qualquer uma das duas chaves
+    return crypto.timingSafeEqual(hashRecebido, hashBridge) || crypto.timingSafeEqual(hashRecebido, hashFgts)
   } catch {
     return false
   }
 }
 
 function requireApiKey(req, res, next) {
-  if (!apiKeyValida(req.headers['x-api-key'])) {
-    return res.status(403).json({ success: false, error: 'Acesso negado: Chave API inválida' })
+  // O Backend pode mandar a chave em qualquer um desses dois headers
+  const recebida = req.headers['x-api-key'] || req.headers['fgts-api-key']
+  
+  if (!apiKeyValida(recebida)) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Acesso negado: Chave API inválida ou ausente. Envie x-api-key no header.' 
+    })
   }
   next()
 }
