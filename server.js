@@ -11,6 +11,7 @@ import { promisify } from 'node:util'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs/promises'
+import zlib from 'node:zlib'
 
 const execFileAsync = promisify(execFile)
 
@@ -56,6 +57,9 @@ function classifyError(err, stage) {
   return { errorType: 'BRIDGE_INTERNAL', stage, code: code || 'UNKNOWN', message: msg, raw: msg }
 }
 
+// ======================================================
+// PFX E mTLS
+// ======================================================
 const pfxConvCache = new Map()
 
 function pfxCacheKey(pfxBase64, password) {
@@ -118,6 +122,9 @@ async function makePfxTls(pfxBase64, password) {
   }
 }
 
+// ======================================================
+// HTTP ENGINE COM COMPRESSÃO (Anti-WAF)
+// ======================================================
 function newCookieJar() {
   const store = new Map()
   return {
@@ -164,7 +171,23 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
       resp.on('data', (c) => chunks.push(c))
       resp.on('end', () => {
         if (jar && resp.headers['set-cookie']) jar.set(resp.headers['set-cookie'])
-        resolve({ status: resp.statusCode, headers: resp.headers, location: resp.headers.location, body: Buffer.concat(chunks).toString('utf8') })
+        
+        // DECOMPRESSÃO NATIVA (Obrigatório para passar pelo Firewall do Governo)
+        const buf = Buffer.concat(chunks)
+        let bodyText = ''
+        const encoding = resp.headers['content-encoding'] || ''
+
+        try {
+          if (encoding.includes('br')) bodyText = zlib.brotliDecompressSync(buf).toString('utf8')
+          else if (encoding.includes('gzip')) bodyText = zlib.gunzipSync(buf).toString('utf8')
+          else if (encoding.includes('deflate')) bodyText = zlib.inflateSync(buf).toString('utf8')
+          else bodyText = buf.toString('utf8')
+        } catch (e) {
+          console.warn('[HTTP] Aviso zlib:', e.message)
+          bodyText = buf.toString('utf8')
+        }
+
+        resolve({ status: resp.statusCode, headers: resp.headers, location: resp.headers.location, body: bodyText })
       })
     })
     reqH.on('error', reject)
@@ -178,24 +201,23 @@ function tryParseJson(str) { try { return JSON.parse(str) } catch { return null 
 function decodeHtmlEntities(str) { return String(str).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x2F;/g, '/') }
 
 // ======================================================
-// LOGIN GOV.BR OAUTH2 (bypass 400 Bad Request via params ocultos nativos)
+// LOGIN GOV.BR OAUTH2 (Navegador Simulado)
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
   const jar = newCookieJar()
   
+  // Headers perfeitos de navegador
   const headersGovBr = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br', // <--- O SEGREDO ANTI-WAF AQUI
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
     'Connection': 'keep-alive',
     'Sec-Fetch-Dest': 'document',
     'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'cross-site',
+    'Sec-Fetch-Site': 'none',
     'Upgrade-Insecure-Requests': '1',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
-    'sec-ch-ua': '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
   }
 
   console.log('[LOGIN] Iniciando fluxo de SSO (OAuth2)...')
@@ -205,28 +227,28 @@ async function loginGovBr(pfxBase64, password) {
   const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`
 
   let currentUrl = authUrl;
-  let loginPageHtml = '';
   let baseLoginUrl = '';
 
-  // 1. IDA
-  for(let i = 0; i < 7; i++) {
+  // 1. IDA ATÉ A TELA DE LOGIN
+  for(let i = 0; i < 5; i++) {
      console.log(`[LOGIN-IDA] GET ${currentUrl.substring(0,80)}...`);
      const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
 
      if (resp.status >= 300 && resp.status < 400 && resp.location) {
          currentUrl = resp.location.startsWith('http') ? resp.location : new URL(resp.location, currentUrl).toString();
+         headersGovBr['Sec-Fetch-Site'] = 'cross-site'; // Após redirecionar, atualizamos o header
          continue;
      }
 
      if (resp.status === 200) {
          if (currentUrl.includes('/login?client_id=')) {
              baseLoginUrl = currentUrl;
-             loginPageHtml = resp.body;
              break;
          }
          
-         if (resp.body.includes('refresh') || resp.body.includes('reload') || resp.body.includes('TSPD_')) {
-             console.log(`[WAF] Desafio detectado. Aguardando...`);
+         // Se, por azar, o WAF ainda encher o saco
+         if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
+             console.log(`[WAF] Challenge recebido. Absorvendo cookies e tentando reconectar...`);
              await new Promise(r => setTimeout(r, 1000));
              const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i);
              if (metaMatch) {
@@ -240,66 +262,32 @@ async function loginGovBr(pfxBase64, password) {
      throw new Error(`Erro HTTP ${resp.status} em ${currentUrl}`);
   }
 
-  if (!baseLoginUrl || !loginPageHtml) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
+  if (!baseLoginUrl) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
 
   // ==========================================================
-  // O SEGREDO DO 400 BAD REQUEST ESTÁ AQUI
-  // O Governo agora envia o POST de certificado APENAS com um input
-  // chamado "cert-digital" ou sem body nenhum, mas com query params.
-  // Vamos varrer toda a página pra ver exatamente qual formulário é submetido.
+  // O PULO DO GATO: GET DIRETO NO CERTIFICADO (Ignora o 400 Bad Request)
+  // Como agora somos um navegador perfeito, nós simplesmente 
+  // "clicamos" no botão do certificado enviando a requisição GET com mTLS
   // ==========================================================
-  let urlLoginTls = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br')
-  let postBody = ''
-
-  const certFormRegex = /<form[^>]+action=["']([^"']+)["'][^>]*id=["']login-certificate["'][^>]*>([\s\S]*?)<\/form>/i;
-  const certFormMatch = loginPageHtml.match(certFormRegex);
+  let urlLoginTls = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
   
-  if (certFormMatch) {
-      // Se achou o form específico do certificado, usa a action exata e extrai seus campos
-      urlLoginTls = certFormMatch[1];
-      if (!urlLoginTls.startsWith('http')) {
-         urlLoginTls = new URL(urlLoginTls, baseLoginUrl).toString().replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
-      }
-
-      const formHtml = certFormMatch[2];
-      const fields = {};
-      const hiddenRegex = /<input[^>]+type=["']?hidden["']?[^>]*>/gi;
-      let m;
-      while ((m = hiddenRegex.exec(formHtml)) !== null) {
-          const tag = m[0];
-          const nameMatch = tag.match(/name=["']([^"']+)["']/i);
-          const valueMatch = tag.match(/value=["']([^"']*)["']/i);
-          if (nameMatch) {
-              fields[nameMatch[1]] = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
-          }
-      }
-      postBody = querystring.stringify(fields);
-  } else {
-     // Fallback: Se a página mudou, ele faz o bypass pelo URL de login, que nativamente
-     // aceita o mTLS se enviarmos os mesmos query params da URL principal.
-  }
-
-  console.log(`[LOGIN] Disparando POST mTLS (Certificado) -> ${urlLoginTls.substring(0, 80)}...`)
+  console.log(`[LOGIN] Enviando mTLS (Certificado) limpo -> ${urlLoginTls.substring(0, 80)}...`)
 
   const certHeaders = {
       ...headersGovBr,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Origin': 'https://sso.acesso.gov.br',
       'Referer': baseLoginUrl,
       'Sec-Fetch-Site': 'same-site'
   }
 
-  const respCert = await httpRequest(urlLoginTls, { method: 'POST', jar, mtls, headers: certHeaders, body: postBody })
+  // Mudamos de POST para GET. É assim que o frontend do Gov.br funciona hoje.
+  const respCert = await httpRequest(urlLoginTls, { method: 'GET', jar, mtls, headers: certHeaders })
 
-  if (respCert.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401).')
+  if (respCert.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401). Verifique a validade/senha.')
   if (respCert.status === 403) throw new Error('WAF Gov.br bloqueou a requisição mTLS (403).')
-  if (respCert.status === 400) {
-      console.error(`[DEBUG 400] HTML da página de login:`, loginPageHtml.substring(0, 2000))
-      throw new Error(`Gov.br retornou 400 Bad Request. O WAF percebeu anomalia no form.`)
-  }
-  if (!respCert.location) throw new Error(`Falha SSO: Sem redirecionamento mTLS. HTTP ${respCert.status}.`)
+  if (respCert.status === 400) throw new Error(`Gov.br retornou 400 Bad Request no mTLS.`)
+  if (!respCert.location) throw new Error(`Falha SSO: Sem redirecionamento mTLS. HTTP ${respCert.status}. A autenticação falhou.`)
 
-  // 3. VOLTA
+  // 3. LOOP DE VOLTA PARA O FGTS DIGITAL
   currentUrl = respCert.location;
   let urlFgtsCode = '';
 
@@ -322,6 +310,7 @@ async function loginGovBr(pfxBase64, password) {
 
   const headersApiFgts = {
       'Accept': 'application/json, text/plain, */*',
+      'Accept-Encoding': 'gzip, deflate, br',
       'Content-Type': 'application/json',
       'User-Agent': headersGovBr['User-Agent'],
       'Referer': urlFgtsCode
@@ -329,8 +318,10 @@ async function loginGovBr(pfxBase64, password) {
 
   console.log('[LOGIN] Gerando Token do FGTS Digital...')
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: JSON.stringify({}) })
+  
   console.log('[LOGIN] Acessando escolha de perfil...')
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersGovBr })
+  
   console.log('[LOGIN] Sincronizando Cookies e Habilitando Acesso...')
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts })
 
@@ -350,7 +341,11 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
 
     const cnpjNum = cnpj.replace(/\D/g,'')
     const empId = `${cnpjNum.substring(0,8)}1`
-    const headers = { 'Accept': 'application/json, text/plain, */*', 'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36' }
+    const headers = { 
+      'Accept': 'application/json, text/plain, */*', 
+      'Accept-Encoding': 'gzip, deflate, br',
+      'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36' 
+    }
 
     console.log(`[FGTS-RPA] Consultando dados para o Empregador ${empId}...`)
 
