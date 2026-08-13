@@ -113,7 +113,7 @@ async function makePfxTls(pfxBase64, password) {
 }
 
 // ======================================================
-// HTTP ENGINE (Com Keep-Alive para WAF F5)
+// HTTP ENGINE
 // ======================================================
 function newCookieJar() {
   const store = new Map()
@@ -155,19 +155,16 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
 
     const opts = { hostname: url.hostname, port: url.port || (isHttps ? 443 : 80), path: url.pathname + url.search, method, timeout, headers: reqHeaders }
     
-    // TRUQUE DO WAF: Usa o GlobalAgent (Keep-Alive) para navegação normal
-    // Só cria o Agent exclusivo quando for injetar o Certificado Digital!
     if (isHttps) {
         opts.rejectUnauthorized = false;
         opts.secureOptions = crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT;
-        
         if (mtls) {
             opts.agent = new https.Agent({
                 rejectUnauthorized: false,
                 secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
                 pfx: mtls.pfx,
                 passphrase: mtls.passphrase,
-                keepAlive: false // Aqui não queremos reaproveitar
+                keepAlive: false 
             });
         }
     }
@@ -206,10 +203,9 @@ async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
   const jar = newCookieJar()
   
-  // Cabeçalhos rigorosamente iguais ao Chrome 151 para não irritar o F5
   const headersGovBr = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
+    'Accept-Encoding': 'gzip, deflate, br, zstd',
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
     'Connection': 'keep-alive',
     'Sec-Ch-Ua': '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
@@ -250,17 +246,21 @@ async function loginGovBr(pfxBase64, password) {
              break;
          }
          
+         // Proteção aprimorada contra o WAF F5
          if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
-             console.log(`[WAF] Challenge recebido. Aguardando para absorver cookies...`);
-             await new Promise(r => setTimeout(r, 1500));
+             console.log(`[WAF] Challenge F5 recebido. Tratando...`);
+             await new Promise(r => setTimeout(r, 1000)); // Tempo para cookie assentar
+             
+             // Tenta extrair a URL de redirecionamento do meta tag
              const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i) || resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
-             if (metaMatch) {
+             if (metaMatch && metaMatch[1].length > 5) {
                  let metaUrl = decodeHtmlEntities(metaMatch[1]);
-                 if (metaUrl.length > 5) {
-                    currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
-                 }
+                 currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
+                 continue;
              }
-             continue;
+             
+             // Se não tiver meta tag, só recarrega a mesma URL pois o cookie TS já foi salvo no jar
+             continue; 
          }
          throw new Error(`Travou numa página desconhecida. HTTP 200. URL: ${currentUrl}`);
      }
@@ -269,9 +269,8 @@ async function loginGovBr(pfxBase64, password) {
 
   if (!baseLoginUrl || !loginPageHtml) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
 
-  console.log('[LOGIN] Fase 2: Extraindo Tokens e simulando o clique no Certificado Digital...')
+  console.log('[LOGIN] Fase 2: Simulando o clique no Certificado Digital...')
   
-  // Pega todos os inputs hidden (ex: csrf_token) para simular o formulário perfeitamente
   const hiddenRegex = /<input[^>]+type=["']?hidden["']?[^>]*>/gi;
   const formData = {};
   let m;
@@ -281,7 +280,6 @@ async function loginGovBr(pfxBase64, password) {
       if (nameMatch) formData[nameMatch[1]] = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
   }
   
-  // O GATILHO MÁGICO: Avisa o Serpro que o usuário clicou em "Seu certificado digital"
   formData['login-certificate'] = 'login-certificate';
 
   const postHeaders = { 
@@ -292,7 +290,6 @@ async function loginGovBr(pfxBase64, password) {
       'Sec-Fetch-Site': 'same-origin'
   };
 
-  console.log(`[LOGIN-POST] POST avisando o uso do certificado...`);
   const postResp = await httpRequest(baseLoginUrl, { method: 'POST', jar, headers: postHeaders, body: querystring.stringify(formData) });
 
   let mtlsUrl = '';
@@ -301,24 +298,16 @@ async function loginGovBr(pfxBase64, password) {
   }
 
   if (!mtlsUrl || !mtlsUrl.includes('certificado.sso')) {
-      console.warn(`[AVISO] Redirecionamento 302 não encontrado. Forçando URL mTLS...`);
       mtlsUrl = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
   }
 
   console.log('[LOGIN] Fase 3: Acessando o Endpoint mTLS injetando o Certificado...')
-  console.log(`[LOGIN-mTLS] GET ${mtlsUrl.substring(0, 80)}...`);
-
-  const certHeaders = {
-      ...headersGovBr,
-      'Referer': baseLoginUrl,
-      'Sec-Fetch-Site': 'same-site'
-  }
-
+  const certHeaders = { ...headersGovBr, 'Referer': baseLoginUrl, 'Sec-Fetch-Site': 'same-site' }
+  
   let certRedirectUrl = '';
   currentUrl = mtlsUrl;
 
   for(let i = 0; i < 4; i++) {
-      // É AQUI que o `mtls` entra em ação criando o Agente isolado
       const respCert = await httpRequest(currentUrl, { method: 'GET', jar, mtls, headers: certHeaders });
 
       if (respCert.status >= 300 && respCert.status < 400 && respCert.location) {
@@ -328,16 +317,15 @@ async function loginGovBr(pfxBase64, password) {
 
       if (respCert.status === 200) {
           if (respCert.body.includes('refresh') || respCert.body.includes('TSPD_')) {
-              console.log(`[WAF] Challenge no subdomínio mTLS. Absorvendo...`);
               await new Promise(r => setTimeout(r, 1000));
-              const metaMatch = respCert.body.match(/url\s*=\s*([^"'>]+)/i) || respCert.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
+              const metaMatch = respCert.body.match(/url\s*=\s*([^"'>]+)/i);
               if (metaMatch) {
                   let metaUrl = decodeHtmlEntities(metaMatch[1]);
                   currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
               }
               continue;
           }
-          throw new Error(`O Gov.br não autenticou o certificado (Retornou a tela de Login). O túnel ou a senha falharam.`);
+          throw new Error(`O Gov.br não autenticou o certificado (Retornou a tela de Login). Verifique validade ou tente novamente.`);
       }
 
       if (respCert.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401). Verifique validade e senha.');
@@ -354,7 +342,6 @@ async function loginGovBr(pfxBase64, password) {
   let urlFgtsCode = '';
 
   for(let i = 0; i < 5; i++) {
-     console.log(`[LOGIN-VOLTA] GET ${currentUrl.substring(0,80)}...`);
      const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
 
      if (resp.status >= 300 && resp.status < 400 && resp.location) {
@@ -370,7 +357,7 @@ async function loginGovBr(pfxBase64, password) {
 
   if (!urlFgtsCode) throw new Error('Falha no SSO: Não chegou na página do FGTS Digital com o CODE.');
 
-  console.log('[LOGIN] Fase 5: Trocando o Código pelo Token JWT (Sessão Definitiva)...')
+  console.log('[LOGIN] Fase 5: Trocando o Código pelo Token JWT...')
   
   const fgtsUrlObj = new URL(urlFgtsCode);
   const fgtsCode = fgtsUrlObj.searchParams.get('code');
@@ -385,50 +372,40 @@ async function loginGovBr(pfxBase64, password) {
   }
 
   const payloadToken = JSON.stringify({ code: fgtsCode, state: fgtsState });
-
-  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { 
-      method: 'POST', 
-      jar, 
-      headers: headersApiFgts, 
-      body: payloadToken 
-  });
+  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: payloadToken });
   
   console.log('[LOGIN] Fase 6: Habilitando Acesso e Sincronizando Perfil...')
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersGovBr })
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts })
 
   console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! 🚀')
-  return { jar, finalUrl: urlFgtsCode, mtls }
+  return { jar, finalUrl: urlFgtsCode, mtls, headersApiFgts }
 }
 
 // ======================================================
-// ROTA PRINCIPAL RPA: Extrato FGTS Digital
+// ROTA 1: Extrato FGTS Digital (Guias e Valores)
 // ======================================================
 app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
   const { cnpj, pfxBase64, password, payloadBusca } = req.body
   if (!cnpj) return res.status(400).json({ success: false, erro: 'CNPJ obrigatório' })
 
   try {
-    const { jar } = await loginGovBr(pfxBase64, password)
+    const { jar, headersApiFgts } = await loginGovBr(pfxBase64, password)
 
     const cnpjNum = cnpj.replace(/\D/g,'')
     const empId = `${cnpjNum.substring(0,8)}1`
-    const headers = { 
-      'Accept': 'application/json, text/plain, */*', 
-      'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36' 
-    }
+    
+    console.log(`[FGTS-RPA] Consultando guias para o Empregador ${empId}...`)
 
-    console.log(`[FGTS-RPA] Consultando dados para o Empregador ${empId}...`)
-
-    const respUsuario = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/usuario', { method:'GET', jar, headers })
+    const respUsuario = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/usuario', { method:'GET', jar, headers: headersApiFgts })
     const dadosUsuario = tryParseJson(respUsuario.body)
 
     let competencias = null;
-    const respComp = await httpRequest(`https://fgtsdigital.sistema.gov.br/consignado/api/empregadores/${empId}/competencias`, { method:'GET', jar, headers })
+    const respComp = await httpRequest(`https://fgtsdigital.sistema.gov.br/consignado/api/empregadores/${empId}/competencias`, { method:'GET', jar, headers: headersApiFgts })
     if (respComp.status === 200) competencias = tryParseJson(respComp.body)
 
     const bodyGuias = payloadBusca || {}
-    const respLista = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/consultar-guias/guias', { method:'POST', jar, headers, body: JSON.stringify(bodyGuias) })
+    const respLista = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/consultar-guias/guias', { method:'POST', jar, headers: headersApiFgts, body: JSON.stringify(bodyGuias) })
     const listaGuias = tryParseJson(respLista.body)
     const guiasArray = Array.isArray(listaGuias) ? listaGuias : (listaGuias?.content || listaGuias?.itens || [])
 
@@ -438,25 +415,62 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
       const idGuia = g.id || g.idGuia || g.numeroGuia
       if (!idGuia) continue
       
-      const respTot = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/totalizador`, { method:'GET', jar, headers })
-      const respDeb = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/debitos?num-pagina=1&tam-pagina=100&campo-ordem=competenciaApuracao&ordem=desc`, { method:'GET', jar, headers })
-      const respConsig = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/consignados?num-pagina=1&tam-pagina=100&campo-ordem=competenciaApuracao&ordem=desc`, { method:'GET', jar, headers })
+      const respTot = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/totalizador`, { method:'GET', jar, headers: headersApiFgts })
+      const respDeb = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/debitos?num-pagina=1&tam-pagina=100&campo-ordem=competenciaApuracao&ordem=desc`, { method:'GET', jar, headers: headersApiFgts })
+      const respConsig = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/consignados?num-pagina=1&tam-pagina=100&campo-ordem=competenciaApuracao&ordem=desc`, { method:'GET', jar, headers: headersApiFgts })
 
       detalhes.push({ guiaBase: g, totalizador: tryParseJson(respTot.body), debitos: tryParseJson(respDeb.body), consignados: tryParseJson(respConsig.body) })
     }
 
-    console.log(`[FGTS-RPA] Extração concluída com sucesso! ${detalhes.length} guias extraídas.`)
-
-    res.json({ success: true, usuario: dadosUsuario, competencias: competencias, guias: detalhes, rawData: { listaGuias, detalhes } })
+    res.json({ success: true, usuario: dadosUsuario, competencias: competencias, guias: detalhes })
 
   } catch(e) {
-    if (e.pfxStage) {
-      console.error(`[FGTS] Erro PFX:`, e.pfxStage, e.message)
-      return res.status(400).json({ success: false, certError: e.pfxStage === 'PFX_INVALID', errorType: e.pfxStage, error: e.message })
-    }
     const c = classifyError(e, 'FGTS')
-    console.error(`[FGTS] Erro:`, c.code, c.raw)
-    return res.status(200).json({ success: false, certError: false, errorType: c.errorType, stage: c.stage, error: c.message, rawError: c.raw })
+    res.status(200).json({ success: false, certError: e.pfxStage === 'PFX_INVALID', errorType: c.errorType, stage: c.stage, error: c.message })
+  }
+});
+
+// ======================================================
+// ROTA 2: Empregados e Vínculos (Ativos, Afastados, Desligados)
+// ======================================================
+app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
+  const { cnpj, pfxBase64, password } = req.body
+  if (!cnpj) return res.status(400).json({ success: false, erro: 'CNPJ obrigatório' })
+
+  try {
+    const { jar, headersApiFgts } = await loginGovBr(pfxBase64, password)
+    
+    console.log(`[FGTS-RPA] Extraindo Vínculos de Funcionários para o CNPJ ${cnpj}...`)
+
+    const statuses = ['ativo', 'afastado', 'desligado']
+    const todosEmpregados = []
+    
+    // Varre as 3 categorias de funcionários
+    for (const st of statuses) {
+        const urlVinculos = `https://fgtsdigital.sistema.gov.br/extrato/api/vinculos/${st}/,,,,0,0?num-pagina=1&tam-pagina=1000&campo-ordem=nmTrabalhador&ordem=asc`
+        const resp = await httpRequest(urlVinculos, { method: 'GET', jar, headers: headersApiFgts })
+        
+        if (resp.status === 200) {
+            const dados = tryParseJson(resp.body)
+            const lista = dados?.content || dados?.itens || dados || []
+            
+            if (Array.isArray(lista)) {
+                // Adiciona a marcação do status e consolida na lista principal
+                lista.forEach(emp => {
+                    emp.statusSistema = st
+                    todosEmpregados.push(emp)
+                })
+            }
+        }
+    }
+
+    console.log(`[FGTS-RPA] Extração concluída! Total de empregados encontrados: ${todosEmpregados.length}`)
+
+    res.json({ success: true, total: todosEmpregados.length, empregados: todosEmpregados })
+
+  } catch(e) {
+    const c = classifyError(e, 'FGTS')
+    res.status(200).json({ success: false, certError: e.pfxStage === 'PFX_INVALID', errorType: c.errorType, stage: c.stage, error: c.message })
   }
 });
 
