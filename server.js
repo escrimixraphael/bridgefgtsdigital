@@ -155,17 +155,21 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
 
     const opts = { hostname: url.hostname, port: url.port || (isHttps ? 443 : 80), path: url.pathname + url.search, method, timeout, headers: reqHeaders }
     
-    // Configuração de rede nativa: 
     if (isHttps) {
         opts.rejectUnauthorized = false;
         opts.secureOptions = crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT;
+        
         if (mtls) {
-            // A TÁTICA DEFINITIVA PARA mTLS NO NODE.JS:
-            // "agent: false" desabilita o pool, forçando a criação de um novo socket TLS 
-            // enviando o certificado exclusivamente nesta requisição!
-            opts.agent = false;
-            opts.pfx = mtls.pfx;
-            opts.passphrase = mtls.passphrase;
+            // TÁTICA ANTI-F5: Força TLS 1.2 explícito para o Handshake do Certificado brilhar!
+            opts.agent = new https.Agent({
+                pfx: mtls.pfx,
+                passphrase: mtls.passphrase,
+                rejectUnauthorized: false,
+                keepAlive: false,
+                minVersion: 'TLSv1.2',
+                maxVersion: 'TLSv1.2',
+                secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
+            });
         }
     }
 
@@ -203,9 +207,8 @@ async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
   const jar = newCookieJar()
   
-  // Cabeçalhos alinhados rigorosamente para passar limpo pelo WAF F5
   const headersGovBr = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'Accept-Encoding': 'gzip, deflate, br, zstd',
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
     'Connection': 'keep-alive',
@@ -228,6 +231,7 @@ async function loginGovBr(pfxBase64, password) {
 
   let currentUrl = authUrl;
   let baseLoginUrl = '';
+  let loginPageHtml = '';
 
   for(let i = 0; i < 6; i++) {
      console.log(`[LOGIN-IDA] GET ${currentUrl.substring(0,80)}...`);
@@ -242,6 +246,7 @@ async function loginGovBr(pfxBase64, password) {
      if (resp.status === 200) {
          if (currentUrl.includes('/login?client_id=')) {
              baseLoginUrl = currentUrl;
+             loginPageHtml = resp.body;
              break;
          }
          if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
@@ -259,12 +264,17 @@ async function loginGovBr(pfxBase64, password) {
      throw new Error(`Erro HTTP ${resp.status} em ${currentUrl}`);
   }
 
-  if (!baseLoginUrl) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
+  if (!baseLoginUrl || !loginPageHtml) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
 
-  console.log('[LOGIN] Fase 2: Redirecionando e acionando o túnel do Certificado (mTLS)...')
+  console.log('[LOGIN] Fase 2: Lendo URL exata do Botão e injetando mTLS (TLS 1.2)...')
   
-  // A URL do certificado é rigorosamente a mesma URL de login, mas no subdomínio 'certificado.sso'
+  // Extrai a URL exata do link "Certificado Digital" de dentro do HTML gerado pelo Serpro
   let mtlsUrl = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
+  const certMatch = loginPageHtml.match(/href=["'](https:\/\/certificado\.sso\.acesso\.gov\.br[^"']+)["']/i);
+  if (certMatch) {
+      mtlsUrl = decodeHtmlEntities(certMatch[1]);
+      console.log('[DEBUG] URL oficial do botão extraída do HTML com sucesso!');
+  }
   
   const certHeaders = {
       ...headersGovBr,
@@ -298,6 +308,7 @@ async function loginGovBr(pfxBase64, password) {
               }
               continue;
           }
+          console.error(`\n================== HTML DO ERRO GOV.BR ==================\n${respCert.body.substring(0, 1000)}\n=========================================================\n`);
           throw new Error(`O Gov.br rejeitou a validação do certificado (Retornou a tela inicial HTTP 200 em vez do Code 302). O certificado pode ser inválido, expirado ou as raízes do Serpro falharam.`);
       }
 
