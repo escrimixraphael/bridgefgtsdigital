@@ -45,8 +45,8 @@ function requireApiKey(req, res, next) {
 function classifyError(err, stage) {
   const code = err?.code || ''
   const msg = err?.message || String(err)
-  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão.' }
-  if (code.startsWith('ERR_TLS') || /handshake|alert|SSL routines/i.test(msg)) return { errorType: 'TLS_HANDSHAKE_ERROR', stage, code: code || 'TLS', message: 'Falha no handshake TLS.' }
+  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão ao acessar Gov.br/FGTS.' }
+  if (code.startsWith('ERR_TLS') || /handshake|alert|SSL routines/i.test(msg)) return { errorType: 'TLS_HANDSHAKE_ERROR', stage, code: code || 'TLS', message: 'Falha no handshake TLS (Certificado).' }
   return { errorType: 'BRIDGE_INTERNAL', stage, code: code || 'UNKNOWN', message: msg, raw: msg }
 }
 
@@ -113,7 +113,7 @@ async function makePfxTls(pfxBase64, password) {
 }
 
 // ======================================================
-// HTTP ENGINE (Com Custom HTTPS Agent)
+// HTTP ENGINE E ISOLAMENTO DE CONEXÃO (O SEGREDO DO MTLS)
 // ======================================================
 function newCookieJar() {
   const store = new Map()
@@ -153,28 +153,19 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
       reqHeaders['Content-Length'] = Buffer.byteLength(body)
     }
 
-    const opts = { 
-        hostname: url.hostname, 
-        port: url.port || (isHttps ? 443 : 80), 
-        path: url.pathname + url.search, 
-        method, 
-        timeout, 
-        headers: reqHeaders 
-    }
+    const opts = { hostname: url.hostname, port: url.port || (isHttps ? 443 : 80), path: url.pathname + url.search, method, timeout, headers: reqHeaders }
     
-    // A BALA DE PRATA: Isolar o Agent para não reaproveitar conexões do Node.js
+    // ISOLAMENTO TOTAL DO AGENT PARA GARANTIR A ENTREGA DO CERTIFICADO
     if (isHttps) {
         const agentOpts = {
-            rejectUnauthorized: false, // Necessário pois o Serpro as vezes tem falha na cadeia root
-            secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT // Essencial para os servidores Gov.br
+            rejectUnauthorized: false,
+            secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
         };
-        
         if (mtls) {
             agentOpts.pfx = mtls.pfx;
             agentOpts.passphrase = mtls.passphrase;
-            agentOpts.keepAlive = false; // Força uma conexão nova com o certificado
+            agentOpts.keepAlive = false; // Garante que não vai reaproveitar a conexão limpa de antes
         }
-        
         opts.agent = new https.Agent(agentOpts);
     }
 
@@ -206,7 +197,7 @@ function tryParseJson(str) { try { return JSON.parse(str) } catch { return null 
 function decodeHtmlEntities(str) { return String(str).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x2F;/g, '/') }
 
 // ======================================================
-// LOGIN GOV.BR OAUTH2
+// LOGIN GOV.BR E FGTS DIGITAL
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
@@ -224,7 +215,7 @@ async function loginGovBr(pfxBase64, password) {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
   }
 
-  console.log('[LOGIN] Fase 1: Entrando no Gov.br principal (GET)...')
+  console.log('[LOGIN] Fase 1: Coletando cookies de sessão inicial...')
   
   const nonce = crypto.randomUUID()
   const state = crypto.randomUUID()
@@ -233,7 +224,6 @@ async function loginGovBr(pfxBase64, password) {
   let currentUrl = authUrl;
   let baseLoginUrl = '';
 
-  // 1. IDA
   for(let i = 0; i < 6; i++) {
      console.log(`[LOGIN-IDA] GET ${currentUrl.substring(0,80)}...`);
      const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
@@ -253,8 +243,7 @@ async function loginGovBr(pfxBase64, password) {
          if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
              console.log(`[WAF] Challenge recebido. Absorvendo cookies...`);
              await new Promise(r => setTimeout(r, 1000));
-             const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i) || 
-                               resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
+             const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i) || resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
              if (metaMatch) {
                  let metaUrl = decodeHtmlEntities(metaMatch[1]);
                  currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
@@ -268,12 +257,9 @@ async function loginGovBr(pfxBase64, password) {
 
   if (!baseLoginUrl) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
 
-  // ==========================================================
-  // 2. MTLS (GET puro na mesma URL, mas no subdomínio certificado)
-  // ==========================================================
-  console.log('[LOGIN] Fase 2: Cookies validados! Disparando o Agent mTLS...')
+  console.log('[LOGIN] Fase 2: Forçando novo túnel TLS e enviando o Certificado...')
   
-  // A URL é a mesma, apenas trocando sso por certificado.sso
+  // Troca para o subdomínio de certificado mantendo exatamente a mesma URL
   let certAction = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
   console.log(`[LOGIN-mTLS] GET ${certAction.substring(0, 80)}...`);
 
@@ -287,7 +273,6 @@ async function loginGovBr(pfxBase64, password) {
   currentUrl = certAction;
 
   for(let i = 0; i < 4; i++) {
-      // Método GET, enviando o parâmetro 'mtls' que aciona nosso Agent customizado!
       const respCert = await httpRequest(currentUrl, { method: 'GET', jar, mtls, headers: certHeaders });
 
       if (respCert.status >= 300 && respCert.status < 400 && respCert.location) {
@@ -307,7 +292,7 @@ async function loginGovBr(pfxBase64, password) {
               continue;
           }
           console.error(`[DEBUG WAF/HTML]:`, respCert.body.substring(0, 300));
-          throw new Error(`O Gov.br não autenticou o certificado (Retornou a tela de Login). O certificado pode estar vencido ou bloqueado.`);
+          throw new Error(`O Gov.br não autenticou o certificado (Retornou a tela de Login). O túnel ou a senha falharam.`);
       }
 
       if (respCert.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401). Verifique validade e senha.');
@@ -318,9 +303,8 @@ async function loginGovBr(pfxBase64, password) {
 
   if (!certRedirectUrl) throw new Error(`Falha SSO: Não conseguiu redirecionar o mTLS após a injeção.`);
 
-  // ==========================================================
-  // 3. RETORNO AO FGTS
-  // ==========================================================
+  console.log('[LOGIN] Fase 3: Retornando ao FGTS Digital com a Autorização...')
+  
   currentUrl = certRedirectUrl;
   let urlFgtsCode = '';
 
@@ -341,23 +325,32 @@ async function loginGovBr(pfxBase64, password) {
 
   if (!urlFgtsCode) throw new Error('Falha no SSO: Não chegou na página do FGTS Digital com o CODE.');
 
-  // ==========================================================
-  // 4. API DO FGTS DIGITAL
-  // ==========================================================
+  console.log('[LOGIN] Fase 4: Trocando o Código pelo Token JWT (Sessão Definitiva)...')
+  
+  // Extrai o Code e o State da URL para enviar no corpo da requisição (Payload)
+  const fgtsUrlObj = new URL(urlFgtsCode);
+  const fgtsCode = fgtsUrlObj.searchParams.get('code');
+  const fgtsState = fgtsUrlObj.searchParams.get('state');
+
   const headersApiFgts = {
       'Accept': 'application/json, text/plain, */*',
       'Content-Type': 'application/json',
       'User-Agent': headersGovBr['User-Agent'],
-      'Referer': urlFgtsCode
+      'Referer': urlFgtsCode,
+      'Origin': 'https://fgtsdigital.sistema.gov.br'
   }
 
-  console.log('[LOGIN] Gerando Token do FGTS Digital...')
-  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: JSON.stringify({}) })
+  const payloadToken = JSON.stringify({ code: fgtsCode, state: fgtsState });
+
+  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { 
+      method: 'POST', 
+      jar, 
+      headers: headersApiFgts, 
+      body: payloadToken 
+  });
   
-  console.log('[LOGIN] Acessando escolha de perfil...')
+  console.log('[LOGIN] Fase 5: Habilitando Acesso e Sincronizando Perfil...')
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersGovBr })
-  
-  console.log('[LOGIN] Sincronizando Cookies e Habilitando Acesso...')
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts })
 
   console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! 🚀')
