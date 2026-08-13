@@ -153,11 +153,21 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
       reqHeaders['Content-Length'] = Buffer.byteLength(body)
     }
 
-    const opts = { hostname: url.hostname, port: url.port || (isHttps ? 443 : 80), path: url.pathname + url.search, method, rejectUnauthorized: false, timeout, headers: reqHeaders }
+    const opts = { 
+        hostname: url.hostname, 
+        port: url.port || (isHttps ? 443 : 80), 
+        path: url.pathname + url.search, 
+        method, 
+        rejectUnauthorized: false, 
+        timeout, 
+        headers: reqHeaders 
+    }
     
+    // INJEÇÃO DO CERTIFICADO + LEGACY SERVER CONNECT (Obrigatório para o Serpro)
     if (mtls) { 
       opts.pfx = mtls.pfx; 
       opts.passphrase = mtls.passphrase; 
+      opts.secureOptions = crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT; 
     }
 
     const reqH = lib.request(opts, (resp) => {
@@ -174,6 +184,8 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
           else if (encoding.includes('deflate')) bodyText = zlib.inflateSync(buf).toString('utf8')
           else bodyText = buf.toString('utf8')
         } catch (e) { bodyText = buf.toString('utf8') }
+        
+        // INTERCEPTA O REDIRECIONAMENTO (Não segue automaticamente)
         resolve({ status: resp.statusCode, headers: resp.headers, location: resp.headers.location, body: bodyText })
       })
     })
@@ -255,20 +267,23 @@ async function loginGovBr(pfxBase64, password) {
   // ==========================================================
   // 2. EXTRAIR A AÇÃO EXATA DO CERTIFICADO NA PÁGINA
   // ==========================================================
-  console.log('[LOGIN] Fase 2: Sessão válida! Injetando Certificado mTLS...')
+  console.log('[LOGIN] Fase 2: Sessão válida! Procurando URL do Certificado mTLS...')
   let certAction = '';
   let certMethod = 'GET';
   let certBody = null;
 
-  const certFormRegex = /<form[^>]*id=["']login-certificate["'][^>]*>([\s\S]*?)<\/form>/i;
+  // Tentar achar um form com id ou action contendo 'certificate'
+  const certFormRegex = /<form[^>]+(?:id=["'][^"']*certificate[^"']*["']|action=["'][^"']*certificate[^"']*["'])[^>]*>([\s\S]*?)<\/form>/i;
   const certFormMatch = loginPageHtml.match(certFormRegex);
 
   if (certFormMatch) {
-      certMethod = 'POST';
-      const formTag = loginPageHtml.match(/<form[^>]*id=["']login-certificate["'][^>]*>/i)[0];
+      const formTag = loginPageHtml.match(/<form[^>]+(?:id=["'][^"']*certificate[^"']*["']|action=["'][^"']*certificate[^"']*["'])[^>]*>/i)[0];
       const actionMatch = formTag.match(/action=["']([^"']+)["']/i);
+      const methodMatch = formTag.match(/method=["']([^"']+)["']/i);
       
-      certAction = actionMatch ? decodeHtmlEntities(actionMatch[1]) : baseLoginUrl.replace('sso', 'certificado.sso');
+      certMethod = methodMatch ? methodMatch[1].toUpperCase() : 'POST';
+      certAction = actionMatch ? decodeHtmlEntities(actionMatch[1]) : baseLoginUrl;
+      
       if (!certAction.startsWith('http')) certAction = new URL(certAction, baseLoginUrl).toString();
       certAction = certAction.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br'); 
 
@@ -280,9 +295,26 @@ async function loginGovBr(pfxBase64, password) {
           const valueMatch = m[0].match(/value=["']([^"']*)["']/i);
           if (nameMatch) fields[nameMatch[1]] = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
       }
+      
+      // Adiciona o gatilho do botão (Keycloak geralmente exige isso)
+      fields['login-certificate'] = 'login-certificate';
       certBody = querystring.stringify(fields);
+      console.log(`[LOGIN] Formulário de certificado encontrado. Método: ${certMethod}`);
   } else {
-      certAction = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
+      // Tentar achar um link <a>
+      const aMatch = loginPageHtml.match(/<a[^>]+(?:id=["'][^"']*certificate[^"']*["']|href=["'][^"']*certificate[^"']*["'])[^>]*href=["']([^"']+)["']/i);
+      if (aMatch) {
+          certAction = decodeHtmlEntities(aMatch[1]);
+          if (!certAction.startsWith('http')) certAction = new URL(certAction, baseLoginUrl).toString();
+          certAction = certAction.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
+          certMethod = 'GET';
+          console.log(`[LOGIN] Link de certificado encontrado.`);
+      } else {
+          // Fallback cego
+          console.log(`[LOGIN] Fallback: Construindo URL de certificado manualmente.`);
+          certAction = baseLoginUrl.replace('/login?', '/login/certificate?').replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
+          certMethod = 'GET';
+      }
   }
 
   console.log(`[LOGIN-mTLS] ${certMethod} ${certAction.substring(0, 80)}...`);
@@ -293,15 +325,11 @@ async function loginGovBr(pfxBase64, password) {
       'Referer': baseLoginUrl,
       'Sec-Fetch-Site': 'same-site'
   }
-  
-  // SÓ adiciona Content-Type se for POST. Corrige o erro "undefined header".
-  if (certMethod === 'POST') {
-      certHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
-  }
+  if (certMethod === 'POST') certHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
 
   let certRedirectUrl = '';
   
-  // 3. ENVIA O CERTIFICADO E ABSORVE WAF DO SUBDOMÍNIO SE EXISTIR
+  // 3. ENVIA O CERTIFICADO
   currentUrl = certAction;
   for(let i = 0; i < 4; i++) {
       const respCert = await httpRequest(currentUrl, { method: certMethod, jar, mtls, headers: certHeaders, body: certBody });
@@ -324,7 +352,8 @@ async function loginGovBr(pfxBase64, password) {
               }
               continue;
           }
-          throw new Error(`Falha mTLS: Servidor retornou HTML ao invés de redirecionar. (Possível bloqueio de WAF ou certificado inválido)`);
+          console.error(`[DEBUG WAF/HTML]:`, respCert.body.substring(0, 400));
+          throw new Error(`Falha mTLS: Servidor retornou HTML ao invés de redirecionar. [Log WAF/HTML habilitado]`);
       }
 
       if (respCert.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401). Verifique validade e senha.');
