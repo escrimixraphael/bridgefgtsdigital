@@ -189,7 +189,7 @@ function tryParseJson(str) { try { return JSON.parse(str) } catch { return null 
 function decodeHtmlEntities(str) { return String(str).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x2F;/g, '/') }
 
 // ======================================================
-// LOGIN GOV.BR OAUTH2 (Fluxo Limpo Direto)
+// LOGIN GOV.BR OAUTH2 (Com Gatilho Correto de Certificado)
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
@@ -215,8 +215,9 @@ async function loginGovBr(pfxBase64, password) {
 
   let currentUrl = authUrl;
   let baseLoginUrl = '';
+  let loginPageHtml = '';
 
-  // 1. IDA (Acessar a tela inicial de Login para pegar Cookies de Sessão)
+  // 1. IDA (Acessar a tela inicial de Login)
   for(let i = 0; i < 6; i++) {
      console.log(`[LOGIN-IDA] GET ${currentUrl.substring(0,80)}...`);
      const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
@@ -230,6 +231,7 @@ async function loginGovBr(pfxBase64, password) {
      if (resp.status === 200) {
          if (currentUrl.includes('/login?client_id=')) {
              baseLoginUrl = currentUrl;
+             loginPageHtml = resp.body;
              break;
          }
          
@@ -252,13 +254,57 @@ async function loginGovBr(pfxBase64, password) {
   if (!baseLoginUrl) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
 
   // ==========================================================
-  // 2. INJETAR CERTIFICADO mTLS (Apenas trocando o subdomínio)
+  // 2. EXTRAIR A AÇÃO DO CERTIFICADO
   // ==========================================================
   console.log('[LOGIN] Fase 2: Sessão válida! Acionando endpoint mTLS...')
   
-  let certAction = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
+  let certAction = '';
   let certMethod = 'GET';
-  console.log(`[LOGIN-mTLS] GET ${certAction.substring(0, 80)}...`);
+  let certBody = null;
+
+  // Analisa o HTML do Gov.br para encontrar o formulário ou botão exato do certificado
+  const formRegex = /<form[^>]*action=["']([^"']+)["'][^>]*>([\s\S]*?)<\/form>/gi;
+  let formMatch;
+  let found = false;
+
+  while ((formMatch = formRegex.exec(loginPageHtml)) !== null) {
+      const action = decodeHtmlEntities(formMatch[1]);
+      const htmlContent = formMatch[2];
+      
+      // Se o formulário tiver um botão ou action com 'certificate' ou 'certificado'
+      if (action.includes('certificate') || htmlContent.includes('login-certificate')) {
+          certMethod = 'POST';
+          certAction = action.startsWith('http') ? action : new URL(action, baseLoginUrl).toString();
+          
+          const fields = {};
+          const hiddenRegex = /<input[^>]+type=["']?hidden["']?[^>]*>/gi;
+          let m;
+          while ((m = hiddenRegex.exec(htmlContent)) !== null) {
+              const nameMatch = m[0].match(/name=["']([^"']+)["']/i);
+              const valueMatch = m[0].match(/value=["']([^"']*)["']/i);
+              if (nameMatch) fields[nameMatch[1]] = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
+          }
+          
+          fields['login-certificate'] = 'login-certificate'; // O gatilho do Serpro
+          certBody = querystring.stringify(fields);
+          found = true;
+          break;
+      }
+  }
+
+  // Se não achou formulário, enviamos um GET forçando o parâmetro na URL
+  if (!found) {
+      console.log(`[LOGIN] Formulário POST não encontrado. Construindo GET com gatilho...`);
+      certMethod = 'GET';
+      const parsedUrl = new URL(baseLoginUrl);
+      parsedUrl.searchParams.set('login-certificate', 'login-certificate');
+      certAction = parsedUrl.toString();
+  }
+
+  // Força o subdomínio mTLS
+  certAction = certAction.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
+
+  console.log(`[LOGIN-mTLS] ${certMethod} ${certAction.substring(0, 80)}...`);
 
   const certHeaders = {
       ...headersGovBr,
@@ -266,12 +312,13 @@ async function loginGovBr(pfxBase64, password) {
       'Referer': baseLoginUrl,
       'Sec-Fetch-Site': 'same-site'
   }
+  if (certMethod === 'POST') certHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
 
   let certRedirectUrl = '';
   
   currentUrl = certAction;
   for(let i = 0; i < 4; i++) {
-      const respCert = await httpRequest(currentUrl, { method: certMethod, jar, mtls, headers: certHeaders });
+      const respCert = await httpRequest(currentUrl, { method: certMethod, jar, mtls, headers: certHeaders, body: certBody });
 
       if (respCert.status >= 300 && respCert.status < 400 && respCert.location) {
           certRedirectUrl = respCert.location.startsWith('http') ? respCert.location : new URL(respCert.location, currentUrl).toString();
@@ -286,16 +333,18 @@ async function loginGovBr(pfxBase64, password) {
               if (metaMatch) {
                   let metaUrl = decodeHtmlEntities(metaMatch[1]);
                   currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
+                  certMethod = 'GET'; 
+                  certBody = null;
               }
               continue;
           }
           console.error(`[DEBUG WAF/HTML]:`, respCert.body.substring(0, 400));
-          throw new Error(`Falha mTLS: Servidor retornou HTML ao invés de redirecionar. Verifique se o e-CNPJ está válido.`);
+          throw new Error(`Falha mTLS: Servidor retornou HTML ao invés de redirecionar. (Faltou o parâmetro de gatilho do Serpro).`);
       }
 
       if (respCert.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401). Verifique validade e senha.');
       if (respCert.status === 403) throw new Error('WAF Gov.br bloqueou a requisição mTLS (403).');
-      if (respCert.status === 404) throw new Error('Endpoint mTLS não encontrado (404). O Gov.br pode ter mudado a URL.');
+      if (respCert.status === 400) throw new Error(`Gov.br retornou 400 Bad Request no mTLS. O Cookie Jar falhou na sincronia.`);
       
       throw new Error(`Falha mTLS: HTTP ${respCert.status}`);
   }
