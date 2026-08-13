@@ -197,7 +197,7 @@ function tryParseJson(str) { try { return JSON.parse(str) } catch { return null 
 function decodeHtmlEntities(str) { return String(str).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x2F;/g, '/') }
 
 // ======================================================
-// LOGIN GOV.BR E FGTS DIGITAL
+// LOGIN GOV.BR E FGTS DIGITAL (FLUXO COMPLETO)
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
@@ -215,7 +215,7 @@ async function loginGovBr(pfxBase64, password) {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
   }
 
-  console.log('[LOGIN] Fase 1: Coletando cookies de sessão inicial...')
+  console.log('[LOGIN] Fase 1: Coletando cookies e HTML da tela de Login...')
   
   const nonce = crypto.randomUUID()
   const state = crypto.randomUUID()
@@ -223,6 +223,7 @@ async function loginGovBr(pfxBase64, password) {
 
   let currentUrl = authUrl;
   let baseLoginUrl = '';
+  let loginPageHtml = '';
 
   for(let i = 0; i < 6; i++) {
      console.log(`[LOGIN-IDA] GET ${currentUrl.substring(0,80)}...`);
@@ -237,6 +238,7 @@ async function loginGovBr(pfxBase64, password) {
      if (resp.status === 200) {
          if (currentUrl.includes('/login?client_id=')) {
              baseLoginUrl = currentUrl;
+             loginPageHtml = resp.body;
              break;
          }
          
@@ -255,13 +257,46 @@ async function loginGovBr(pfxBase64, password) {
      throw new Error(`Erro HTTP ${resp.status} em ${currentUrl}`);
   }
 
-  if (!baseLoginUrl) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
+  if (!baseLoginUrl || !loginPageHtml) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
 
-  console.log('[LOGIN] Fase 2: Forçando novo túnel TLS e enviando o Certificado...')
+  console.log('[LOGIN] Fase 2: Extraindo Tokens e simulando o clique no Certificado Digital...')
   
-  // Troca para o subdomínio de certificado mantendo exatamente a mesma URL
-  let certAction = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
-  console.log(`[LOGIN-mTLS] GET ${certAction.substring(0, 80)}...`);
+  // Extrai os campos ocultos de segurança da página para enviar junto com o POST
+  const hiddenRegex = /<input[^>]+type=["']?hidden["']?[^>]*>/gi;
+  const formData = {};
+  let m;
+  while ((m = hiddenRegex.exec(loginPageHtml)) !== null) {
+      const nameMatch = m[0].match(/name=["']([^"']+)["']/i);
+      const valueMatch = m[0].match(/value=["']([^"']*)["']/i);
+      if (nameMatch) formData[nameMatch[1]] = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
+  }
+  
+  // O GATILHO MÁGICO: Avisa o Serpro que vamos usar o certificado
+  formData['login-certificate'] = 'login-certificate';
+
+  const postHeaders = { 
+      ...headersGovBr, 
+      'Content-Type': 'application/x-www-form-urlencoded', 
+      'Referer': baseLoginUrl,
+      'Origin': 'https://sso.acesso.gov.br'
+  };
+
+  console.log(`[LOGIN-POST] POST avisando o uso do certificado...`);
+  const postResp = await httpRequest(baseLoginUrl, { method: 'POST', jar, headers: postHeaders, body: querystring.stringify(formData) });
+
+  let mtlsUrl = '';
+  // O Gov.br DEVE nos redirecionar para a URL do certificado
+  if (postResp.status >= 300 && postResp.status < 400 && postResp.location) {
+      mtlsUrl = postResp.location.startsWith('http') ? postResp.location : new URL(postResp.location, baseLoginUrl).toString();
+  }
+
+  if (!mtlsUrl || !mtlsUrl.includes('certificado.sso')) {
+      console.warn(`[AVISO] Redirecionamento 302 não encontrado. Forçando URL mTLS...`);
+      mtlsUrl = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
+  }
+
+  console.log('[LOGIN] Fase 3: Acessando o Endpoint mTLS injetando o Certificado...')
+  console.log(`[LOGIN-mTLS] GET ${mtlsUrl.substring(0, 80)}...`);
 
   const certHeaders = {
       ...headersGovBr,
@@ -270,7 +305,7 @@ async function loginGovBr(pfxBase64, password) {
   }
 
   let certRedirectUrl = '';
-  currentUrl = certAction;
+  currentUrl = mtlsUrl;
 
   for(let i = 0; i < 4; i++) {
       const respCert = await httpRequest(currentUrl, { method: 'GET', jar, mtls, headers: certHeaders });
@@ -303,7 +338,7 @@ async function loginGovBr(pfxBase64, password) {
 
   if (!certRedirectUrl) throw new Error(`Falha SSO: Não conseguiu redirecionar o mTLS após a injeção.`);
 
-  console.log('[LOGIN] Fase 3: Retornando ao FGTS Digital com a Autorização...')
+  console.log('[LOGIN] Fase 4: Retornando ao FGTS Digital com a Autorização...')
   
   currentUrl = certRedirectUrl;
   let urlFgtsCode = '';
@@ -325,7 +360,7 @@ async function loginGovBr(pfxBase64, password) {
 
   if (!urlFgtsCode) throw new Error('Falha no SSO: Não chegou na página do FGTS Digital com o CODE.');
 
-  console.log('[LOGIN] Fase 4: Trocando o Código pelo Token JWT (Sessão Definitiva)...')
+  console.log('[LOGIN] Fase 5: Trocando o Código pelo Token JWT (Sessão Definitiva)...')
   
   // Extrai o Code e o State da URL para enviar no corpo da requisição (Payload)
   const fgtsUrlObj = new URL(urlFgtsCode);
@@ -349,7 +384,7 @@ async function loginGovBr(pfxBase64, password) {
       body: payloadToken 
   });
   
-  console.log('[LOGIN] Fase 5: Habilitando Acesso e Sincronizando Perfil...')
+  console.log('[LOGIN] Fase 6: Habilitando Acesso e Sincronizando Perfil...')
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersGovBr })
   await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts })
 
