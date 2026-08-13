@@ -153,17 +153,8 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
       reqHeaders['Content-Length'] = Buffer.byteLength(body)
     }
 
-    const opts = { 
-        hostname: url.hostname, 
-        port: url.port || (isHttps ? 443 : 80), 
-        path: url.pathname + url.search, 
-        method, 
-        rejectUnauthorized: false, 
-        timeout, 
-        headers: reqHeaders 
-    }
+    const opts = { hostname: url.hostname, port: url.port || (isHttps ? 443 : 80), path: url.pathname + url.search, method, rejectUnauthorized: false, timeout, headers: reqHeaders }
     
-    // INJEÇÃO DO CERTIFICADO + LEGACY SERVER CONNECT (Obrigatório para o Serpro)
     if (mtls) { 
       opts.pfx = mtls.pfx; 
       opts.passphrase = mtls.passphrase; 
@@ -184,8 +175,6 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
           else if (encoding.includes('deflate')) bodyText = zlib.inflateSync(buf).toString('utf8')
           else bodyText = buf.toString('utf8')
         } catch (e) { bodyText = buf.toString('utf8') }
-        
-        // INTERCEPTA O REDIRECIONAMENTO (Não segue automaticamente)
         resolve({ status: resp.statusCode, headers: resp.headers, location: resp.headers.location, body: bodyText })
       })
     })
@@ -267,7 +256,6 @@ async function loginGovBr(pfxBase64, password) {
   // ==========================================================
   console.log('[LOGIN] Fase 2: Sessão válida! Acionando endpoint mTLS...')
   
-  // O pulo do gato: A URL é idêntica à do login normal, apenas trocamos o subdomínio!
   let certAction = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
   let certMethod = 'GET';
   console.log(`[LOGIN-mTLS] GET ${certAction.substring(0, 80)}...`);
@@ -340,29 +328,6 @@ async function loginGovBr(pfxBase64, password) {
   // ==========================================================
   // 4. CHAMADAS INTERNAS DA API FGTS
   // ==========================================================
-  const headersApiFgts = {
-      'Accept': 'application/json, text/plain, */*',
-      'Content-Type': 'application/json',
-      'User-Agent': headersGovBr['User-Agent'],
-      'Referer': urlFgtsCode
-  }
-
-  console.log('[LOGIN] Gerando Token do FGTS Digital...')
-  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: JSON.stringify({}) })
-  
-  console.log('[LOGIN] Acessando escolha de perfil...')
-  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersGovBr })
-  
-  console.log('[LOGIN] Sincronizando Cookies e Habilitando Acesso...')
-  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts })
-
-  console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! 🚀')
-  return { jar, finalUrl: urlFgtsCode, mtls }
-}
-
- if (!urlFgtsCode) throw new Error('Falha no SSO: Não chegou na página do FGTS Digital com o CODE.');
-
-  // 5. CHAMADAS INTERNAS DA API FGTS
   const headersApiFgts = {
       'Accept': 'application/json, text/plain, */*',
       'Content-Type': 'application/json',
