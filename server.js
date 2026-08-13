@@ -131,7 +131,10 @@ function tryParseJson(str) { try { return JSON.parse(str) } catch { return null 
 async function loginGovBr(pfxBase64, password) {
   console.log('[LOGIN] Iniciando motor blindado (Playwright) para bypass do WAF...');
 
-  // 1. Salva o PFX temporariamente para o Playwright conseguir ler
+  // 1. PROCESSA O CERTIFICADO PRIMEIRO! (Converte legados para AES-256 se necessário)
+  const mtls = await makePfxTls(pfxBase64, password);
+
+  // 2. Salva o PFX modernizado temporariamente para o Playwright conseguir ler
   const tmpDir = os.tmpdir();
   const certId = crypto.randomUUID();
   const certPath = path.join(tmpDir, `cert_${certId}.pfx`);
@@ -139,9 +142,10 @@ async function loginGovBr(pfxBase64, password) {
   let browser;
 
   try {
-    await fs.writeFile(certPath, Buffer.from(pfxBase64, 'base64'));
+    // Escrevemos o buffer já modernizado (mtls.pfx) em vez do base64 original
+    await fs.writeFile(certPath, mtls.pfx);
 
-    // 2. Abre o navegador invisível injetando o certificado mTLS
+    // 3. Abre o navegador invisível injetando o certificado mTLS moderno
     browser = await chromium.launchPersistentContext('', {
       headless: true, // Roda em background
       args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'], 
@@ -149,13 +153,13 @@ async function loginGovBr(pfxBase64, password) {
       clientCertificates: [{
         origin: 'https://*.gov.br',
         pfxPath: certPath,
-        passphrase: password || ''
+        passphrase: mtls.passphrase // Usa a senha garantida pelo conversor
       }]
     });
 
     const page = browser.pages()[0] || await browser.newPage();
 
-    // 3. FASE 1: Entrando no SSO (Playwright resolve o JS e o WAF automaticamente)
+    // 4. FASE 1: Entrando no SSO (Playwright resolve o JS e o WAF automaticamente)
     console.log('[LOGIN] Acessando URL de autorização Gov.br...');
     const nonce = crypto.randomUUID();
     const state = crypto.randomUUID();
@@ -163,18 +167,18 @@ async function loginGovBr(pfxBase64, password) {
 
     await page.goto(authUrl, { waitUntil: 'networkidle' });
 
-    // 4. FASE 2: Clicar no certificado (O mTLS ocorre nativamente pelo Playwright)
+    // 5. FASE 2: Clicar no certificado (O mTLS ocorre nativamente pelo Playwright)
     console.log('[LOGIN] Clicando em "Seu certificado digital"...');
     await page.locator('button:has-text("Seu certificado digital"), a:has-text("Seu certificado digital"), [data-sso-type="certificate"]').first().click();
 
-    // 5. FASE 3: Aguardando o retorno para o FGTS Digital com o CODE
+    // 6. FASE 3: Aguardando o retorno para o FGTS Digital com o CODE
     console.log('[LOGIN] Aguardando validação do Governo e redirecionamento...');
     await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 60000 });
     
     const urlFgtsCode = page.url();
     console.log('[LOGIN] Sucesso! Capturamos o CODE de autorização.');
 
-    // 6. Extraindo os cookies "humanos" que o Chrome validou para o nosso backend HTTP
+    // 7. Extraindo os cookies "humanos" que o Chrome validou para o nosso backend HTTP
     const playwrightCookies = await browser.cookies();
     const jar = newCookieJar();
     const setCookieArray = playwrightCookies.map(c => `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}`);
@@ -184,7 +188,7 @@ async function loginGovBr(pfxBase64, password) {
     await browser.close();
     await fs.unlink(certPath).catch(() => {}); // Limpa o cert temporário
     
-    // 7. FASE 4: Trocando o Código pelo Token JWT usando o seu motor HTTP (rápido!)
+    // 8. FASE 4: Trocando o Código pelo Token JWT usando o seu motor HTTP (rápido!)
     console.log('[LOGIN] Trocando o Código pelo Token JWT no backend HTTP...');
     
     const fgtsUrlObj = new URL(urlFgtsCode);
