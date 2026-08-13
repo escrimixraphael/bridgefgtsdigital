@@ -10,12 +10,11 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import os from 'node:os'
 import path from 'node:path'
-import fs from 'node:fs/promises' // <-- Vamos usar apenas 'fs' para promises
+import fs from 'node:fs/promises'
 import zlib from 'node:zlib'
 import { chromium } from 'playwright'
 
 const execFileAsync = promisify(execFile)
-
 
 const app = express()
 app.use(cors())
@@ -53,69 +52,7 @@ function classifyError(err, stage) {
 }
 
 // ======================================================
-// PFX E mTLS
-// ======================================================
-const pfxConvCache = new Map()
-
-function pfxCacheKey(pfxBase64, password) {
-  return crypto.createHash('sha256').update(pfxBase64.slice(0, 200) + '::' + pfxBase64.length + '::' + (password || '')).digest('hex')
-}
-
-async function convertLegacyPfx(pfxBuffer, password) {
-  const tmp = os.tmpdir()
-  const id = crypto.randomBytes(8).toString('hex')
-  const inPfx = path.join(tmp, `in_${id}.pfx`)
-  const pem = path.join(tmp, `mid_${id}.pem`)
-  const outPfx = path.join(tmp, `out_${id}.pfx`)
-  const pass = password || ''
-  const cleanup = async () => Promise.allSettled([fs.unlink(inPfx), fs.unlink(pem), fs.unlink(outPfx)])
-
-  try {
-    await fs.writeFile(inPfx, pfxBuffer)
-    await execFileAsync('openssl', ['pkcs12', '-in', inPfx, '-nodes', '-legacy', '-passin', `pass:${pass}`, '-out', pem])
-    await execFileAsync('openssl', ['pkcs12', '-export', '-in', pem, '-out', outPfx, '-passout', `pass:${pass}`, '-keypbe', 'AES-256-CBC', '-certpbe', 'AES-256-CBC', '-macalg', 'sha256'])
-    const converted = await fs.readFile(outPfx)
-    console.log(`[PFX] Reempacotado para AES-256 com sucesso (${converted.length} bytes)`)
-    return converted
-  } finally { await cleanup() }
-}
-
-async function makePfxTls(pfxBase64, password) {
-  if (!pfxBase64) { const e = new Error('Certificado ausente'); e.pfxStage = 'MISSING'; throw e }
-  const pfx = Buffer.from(pfxBase64, 'base64')
-  if (pfx.length < 500) { const e = new Error('PFX vazio'); e.pfxStage = 'TRUNCATED'; throw e }
-  const passphrase = password || ''
-
-  try {
-    tls.createSecureContext({ pfx, passphrase })
-    return { pfx, passphrase, converted: false }
-  } catch (err) {
-    const msg = err.message || ''
-    if (/unsupported|digital envelope|legacy|EVP_|routines/i.test(msg)) {
-      const ck = pfxCacheKey(pfxBase64, password)
-      const cached = pfxConvCache.get(ck)
-      if (cached) return { pfx: cached, passphrase, converted: true }
-      try {
-        console.warn('[PFX] PFX legado detectado — convertendo para AES-256...')
-        const convertedPfx = await convertLegacyPfx(pfx, passphrase)
-        tls.createSecureContext({ pfx: convertedPfx, passphrase })
-        pfxConvCache.set(ck, convertedPfx)
-        return { pfx: convertedPfx, passphrase, converted: true }
-      } catch (convErr) {
-        const rawConv = convErr.stderr || convErr.message || ''
-        if (/mac verify|invalid password|wrong password/i.test(rawConv)) {
-          const e = new Error('Senha do certificado incorreta'); e.pfxStage = 'PFX_INVALID'; throw e
-        }
-        const e = new Error('Falha na conversão do PFX: ' + rawConv); e.pfxStage = 'PFX_LEGACY_ALGO'; throw e
-      }
-    }
-    if (/mac verify|invalid password/i.test(msg)) { const e = new Error('Senha incorreta'); e.pfxStage = 'PFX_INVALID'; throw e }
-    const e = new Error('Falha ao carregar cert: ' + msg); e.pfxStage = 'PFX_LOAD_ERROR'; throw e
-  }
-}
-
-// ======================================================
-// HTTP ENGINE & COOKIE JAR
+// HTTP ENGINE & COOKIE JAR (PARA ROTAS FGTS)
 // ======================================================
 function newCookieJar() {
   const store = new Map()
@@ -136,17 +73,11 @@ function newCookieJar() {
     },
     header() {
       return Array.from(store.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
-    },
-    // Método novo para limpar cookies que causam block no WAF ao mudar de domínio
-    deletePattern(regex) {
-      for (const k of store.keys()) {
-        if (regex.test(k)) store.delete(k);
-      }
     }
   }
 }
 
-function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls = null, timeout = 30000, jar = null } = {}) {
+function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, timeout = 30000, jar = null } = {}) {
   return new Promise((resolve, reject) => {
     let url; try { url = new URL(urlStr) } catch { return reject(new Error('URL inválida: ' + urlStr)) }
     const isHttps = url.protocol === 'https:'
@@ -166,18 +97,6 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
     if (isHttps) {
         opts.rejectUnauthorized = false;
         opts.secureOptions = crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT;
-        
-        if (mtls) {
-            // Removida a trava rígida de TLS 1.2 que causa block em WAFs modernos.
-            // Injeção limpa de certificado.
-            opts.agent = new https.Agent({
-                rejectUnauthorized: false,
-                secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
-                pfx: mtls.pfx,
-                passphrase: mtls.passphrase,
-                keepAlive: false
-            });
-        }
     }
 
     const reqH = lib.request(opts, (resp) => {
@@ -205,7 +124,6 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
 }
 
 function tryParseJson(str) { try { return JSON.parse(str) } catch { return null } }
-function decodeHtmlEntities(str) { return String(str).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x2F;/g, '/') }
 
 // ======================================================
 // LOGIN GOV.BR E FGTS DIGITAL (VIA PLAYWRIGHT - BYPASS WAF)
@@ -218,55 +136,55 @@ async function loginGovBr(pfxBase64, password) {
   const certId = crypto.randomUUID();
   const certPath = path.join(tmpDir, `cert_${certId}.pfx`);
   
-  await fsPromises.writeFile(certPath, Buffer.from(pfxBase64, 'base64'));
-
-  // 2. Abre o navegador de verdade (invisível) injetando o certificado
-  const browser = await chromium.launchPersistentContext('', {
-    headless: true, // Roda em background
-    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'], // Esconde o fato de ser um robô
-    ignoreHTTPSErrors: true,
-    clientCertificates: [{
-      origin: 'https://*.gov.br',
-      pfxPath: certPath,
-      passphrase: password
-    }]
-  });
-
-  const page = browser.pages()[0] || await browser.newPage();
+  let browser;
 
   try {
-    // 3. FASE 1: Entrando no SSO do FGTS Digital (O Playwright engole o Desafio WAF aqui!)
-    console.log('[LOGIN] Acessando URL de autorização...');
+    await fs.writeFile(certPath, Buffer.from(pfxBase64, 'base64'));
+
+    // 2. Abre o navegador invisível injetando o certificado mTLS
+    browser = await chromium.launchPersistentContext('', {
+      headless: true, // Roda em background
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'], 
+      ignoreHTTPSErrors: true,
+      clientCertificates: [{
+        origin: 'https://*.gov.br',
+        pfxPath: certPath,
+        passphrase: password || ''
+      }]
+    });
+
+    const page = browser.pages()[0] || await browser.newPage();
+
+    // 3. FASE 1: Entrando no SSO (Playwright resolve o JS e o WAF automaticamente)
+    console.log('[LOGIN] Acessando URL de autorização Gov.br...');
     const nonce = crypto.randomUUID();
     const state = crypto.randomUUID();
     const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`;
 
     await page.goto(authUrl, { waitUntil: 'networkidle' });
 
-    // 4. FASE 2 e 3: Clicar no certificado (O mTLS ocorre nativamente pelo Playwright)
+    // 4. FASE 2: Clicar no certificado (O mTLS ocorre nativamente pelo Playwright)
     console.log('[LOGIN] Clicando em "Seu certificado digital"...');
     await page.locator('button:has-text("Seu certificado digital"), a:has-text("Seu certificado digital"), [data-sso-type="certificate"]').first().click();
 
-    // 5. FASE 4: Aguardando o retorno para o FGTS Digital com o CODE
+    // 5. FASE 3: Aguardando o retorno para o FGTS Digital com o CODE
     console.log('[LOGIN] Aguardando validação do Governo e redirecionamento...');
     await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 60000 });
     
     const urlFgtsCode = page.url();
     console.log('[LOGIN] Sucesso! Capturamos o CODE de autorização.');
 
-    // 6. Extraindo os cookies "humanos" que o Chrome validou
+    // 6. Extraindo os cookies "humanos" que o Chrome validou para o nosso backend HTTP
     const playwrightCookies = await browser.cookies();
-    
-    // Convertendo para o formato do seu "jar" original para não quebrar o resto do seu código HTTP
     const jar = newCookieJar();
     const setCookieArray = playwrightCookies.map(c => `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}`);
     jar.set(setCookieArray);
 
     // ================= FIM DA ATUAÇÃO DO PLAYWRIGHT =================
     await browser.close();
-    await fsPromises.unlink(certPath).catch(() => {}); // Limpa o cert temporário
+    await fs.unlink(certPath).catch(() => {}); // Limpa o cert temporário
     
-    // 7. FASE 5: Trocando o Código pelo Token JWT usando o seu motor HTTP (rápido!)
+    // 7. FASE 4: Trocando o Código pelo Token JWT usando o seu motor HTTP (rápido!)
     console.log('[LOGIN] Trocando o Código pelo Token JWT no backend HTTP...');
     
     const fgtsUrlObj = new URL(urlFgtsCode);
@@ -290,13 +208,12 @@ async function loginGovBr(pfxBase64, password) {
 
     console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! 🚀');
     
-    // Retorna a exata mesma estrutura que as suas Rotas 1 e 2 (Extrato/Empregados) estão esperando
     return { jar, finalUrl: urlFgtsCode, headersApiFgts };
 
   } catch (error) {
     console.error('[LOGIN-ERRO]', error);
-    await browser.close();
-    await fsPromises.unlink(certPath).catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+    await fs.unlink(certPath).catch(() => {});
     throw error;
   }
 }
