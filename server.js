@@ -12,6 +12,11 @@ import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 import zlib from 'node:zlib'
+import { chromium } from 'playwright';
+import path from 'node:path';
+import fsPromises from 'node:fs/promises';
+import crypto from 'node:crypto';
+import os from 'node:os';
 
 const execFileAsync = promisify(execFile)
 
@@ -206,171 +211,97 @@ function tryParseJson(str) { try { return JSON.parse(str) } catch { return null 
 function decodeHtmlEntities(str) { return String(str).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x2F;/g, '/') }
 
 // ======================================================
-// LOGIN GOV.BR E FGTS DIGITAL (FLUXO COMPLETO)
+// LOGIN GOV.BR E FGTS DIGITAL (VIA PLAYWRIGHT - BYPASS WAF)
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
-  const mtls = await makePfxTls(pfxBase64, password)
-  const jar = newCookieJar()
+  console.log('[LOGIN] Iniciando motor blindado (Playwright) para bypass do WAF...');
+
+  // 1. Salva o PFX temporariamente para o Playwright conseguir ler
+  const tmpDir = os.tmpdir();
+  const certId = crypto.randomUUID();
+  const certPath = path.join(tmpDir, `cert_${certId}.pfx`);
   
-  const headersGovBr = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Connection': 'keep-alive',
-    'Sec-Ch-Ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
+  await fsPromises.writeFile(certPath, Buffer.from(pfxBase64, 'base64'));
+
+  // 2. Abre o navegador de verdade (invisível) injetando o certificado
+  const browser = await chromium.launchPersistentContext('', {
+    headless: true, // Roda em background
+    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'], // Esconde o fato de ser um robô
+    ignoreHTTPSErrors: true,
+    clientCertificates: [{
+      origin: 'https://*.gov.br',
+      pfxPath: certPath,
+      passphrase: password
+    }]
+  });
+
+  const page = browser.pages()[0] || await browser.newPage();
+
+  try {
+    // 3. FASE 1: Entrando no SSO do FGTS Digital (O Playwright engole o Desafio WAF aqui!)
+    console.log('[LOGIN] Acessando URL de autorização...');
+    const nonce = crypto.randomUUID();
+    const state = crypto.randomUUID();
+    const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`;
+
+    await page.goto(authUrl, { waitUntil: 'networkidle' });
+
+    // 4. FASE 2 e 3: Clicar no certificado (O mTLS ocorre nativamente pelo Playwright)
+    console.log('[LOGIN] Clicando em "Seu certificado digital"...');
+    await page.locator('button:has-text("Seu certificado digital"), a:has-text("Seu certificado digital"), [data-sso-type="certificate"]').first().click();
+
+    // 5. FASE 4: Aguardando o retorno para o FGTS Digital com o CODE
+    console.log('[LOGIN] Aguardando validação do Governo e redirecionamento...');
+    await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 60000 });
+    
+    const urlFgtsCode = page.url();
+    console.log('[LOGIN] Sucesso! Capturamos o CODE de autorização.');
+
+    // 6. Extraindo os cookies "humanos" que o Chrome validou
+    const playwrightCookies = await browser.cookies();
+    
+    // Convertendo para o formato do seu "jar" original para não quebrar o resto do seu código HTTP
+    const jar = newCookieJar();
+    const setCookieArray = playwrightCookies.map(c => `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}`);
+    jar.set(setCookieArray);
+
+    // ================= FIM DA ATUAÇÃO DO PLAYWRIGHT =================
+    await browser.close();
+    await fsPromises.unlink(certPath).catch(() => {}); // Limpa o cert temporário
+    
+    // 7. FASE 5: Trocando o Código pelo Token JWT usando o seu motor HTTP (rápido!)
+    console.log('[LOGIN] Trocando o Código pelo Token JWT no backend HTTP...');
+    
+    const fgtsUrlObj = new URL(urlFgtsCode);
+    const fgtsCode = fgtsUrlObj.searchParams.get('code');
+    const fgtsState = fgtsUrlObj.searchParams.get('state');
+
+    const headersApiFgts = {
+        'Accept': 'application/json, text/plain, */*',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'Referer': urlFgtsCode,
+        'Origin': 'https://fgtsdigital.sistema.gov.br'
+    };
+
+    const payloadToken = JSON.stringify({ code: fgtsCode, state: fgtsState });
+    await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: payloadToken });
+    
+    console.log('[LOGIN] Habilitando Acesso e Sincronizando Perfil...');
+    await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersApiFgts });
+    await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts });
+
+    console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! 🚀');
+    
+    // Retorna a exata mesma estrutura que as suas Rotas 1 e 2 (Extrato/Empregados) estão esperando
+    return { jar, finalUrl: urlFgtsCode, headersApiFgts };
+
+  } catch (error) {
+    console.error('[LOGIN-ERRO]', error);
+    await browser.close();
+    await fsPromises.unlink(certPath).catch(() => {});
+    throw error;
   }
-
-  console.log('[LOGIN] Fase 1: Entrando no Gov.br principal...')
-  
-  const nonce = crypto.randomUUID()
-  const state = crypto.randomUUID()
-  const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`
-
-  let currentUrl = authUrl;
-  let baseLoginUrl = '';
-  let loginPageHtml = '';
-
-  for(let i = 0; i < 6; i++) {
-     console.log(`[LOGIN-IDA] GET ${currentUrl.substring(0,80)}...`);
-     const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
-
-     if (resp.status >= 300 && resp.status < 400 && resp.location) {
-         currentUrl = resp.location.startsWith('http') ? resp.location : new URL(resp.location, currentUrl).toString();
-         headersGovBr['Sec-Fetch-Site'] = 'same-site';
-         continue;
-     }
-
-     if (resp.status === 200) {
-         if (currentUrl.includes('/login?client_id=')) {
-             baseLoginUrl = currentUrl;
-             loginPageHtml = resp.body;
-             break;
-         }
-         if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
-             console.log(`[WAF] Challenge recebido. Absorvendo cookies e aguardando...`);
-             await new Promise(r => setTimeout(r, 1500)); 
-             const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i) || resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
-             if (metaMatch) {
-                 let metaUrl = decodeHtmlEntities(metaMatch[1]).replace(/['"]/g, '').trim();
-                 currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
-             }
-             continue;
-         }
-         throw new Error(`Travou numa página desconhecida. HTTP 200. URL: ${currentUrl}`);
-     }
-     throw new Error(`Erro HTTP ${resp.status} em ${currentUrl}`);
-  }
-
-  if (!baseLoginUrl) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
-
-  console.log('[LOGIN] Fase 2: Transição para domínio de Certificado (Substituição de URL e Limpeza WAF)...')
-  
-  // O gov.br usa GET direto no subdomínio de certificado, herdando as variáveis da URL
-  let mtlsUrl = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
-  
-  // Limpamos os cookies do F5/Balanceador antigo para não dar conflito ao cruzar de "sso" para "certificado.sso"
-  jar.deletePattern(/^TS01/);
-  jar.deletePattern(/^TSPD/);
-
-  console.log('[LOGIN] Fase 3: Acessando o Endpoint mTLS injetando o Certificado...')
-  
-  const certHeaders = {
-      ...headersGovBr,
-      'Referer': baseLoginUrl,
-      'Sec-Fetch-Site': 'same-site'
-  }
-
-  let certRedirectUrl = '';
-  currentUrl = mtlsUrl;
-
-  for(let i = 0; i < 4; i++) {
-      console.log(`[LOGIN-mTLS] GET ${currentUrl.substring(0, 80)}...`);
-      
-      const respCert = await httpRequest(currentUrl, { method: 'GET', jar, mtls, headers: certHeaders });
-
-      console.log(`[LOGIN-mTLS] Recebido Status: ${respCert.status}`);
-
-      if (respCert.status >= 300 && respCert.status < 400 && respCert.location) {
-          certRedirectUrl = respCert.location.startsWith('http') ? respCert.location : new URL(respCert.location, currentUrl).toString();
-          console.log(`[LOGIN-mTLS] SUCESSO! Certificado validado.`);
-          break;
-      }
-
-      if (respCert.status === 200) {
-          if (respCert.body.includes('refresh') || respCert.body.includes('TSPD_')) {
-              console.log(`[WAF-mTLS] Challenge recebido no túnel seguro. Prosseguindo...`);
-              await new Promise(r => setTimeout(r, 1500));
-              const metaMatch = respCert.body.match(/url\s*=\s*([^"'>]+)/i) || respCert.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
-              if (metaMatch) {
-                  let metaUrl = decodeHtmlEntities(metaMatch[1]).replace(/['"]/g, '').trim();
-                  currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
-              }
-              continue;
-          }
-          throw new Error(`O Gov.br rejeitou a validação do certificado (Retornou a tela inicial HTTP 200).`);
-      }
-
-      if (respCert.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401). Verifique validade e senha.');
-      if (respCert.status === 403) throw new Error('WAF Gov.br bloqueou a requisição mTLS (403).');
-      
-      throw new Error(`Falha mTLS: HTTP ${respCert.status}`);
-  }
-
-  if (!certRedirectUrl) throw new Error(`Falha SSO: Não conseguiu redirecionar o mTLS após a injeção.`);
-
-  console.log('[LOGIN] Fase 4: Retornando ao FGTS Digital com a Autorização...')
-  
-  currentUrl = certRedirectUrl;
-  let urlFgtsCode = '';
-
-  for(let i = 0; i < 5; i++) {
-     console.log(`[LOGIN-VOLTA] GET ${currentUrl.substring(0,80)}...`);
-     const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
-
-     if (resp.status >= 300 && resp.status < 400 && resp.location) {
-         currentUrl = resp.location.startsWith('http') ? resp.location : new URL(resp.location, currentUrl).toString();
-         continue;
-     }
-
-     if (resp.status === 200 && (currentUrl.includes('code=') || currentUrl.includes('acessogov'))) {
-         urlFgtsCode = currentUrl;
-         break;
-     }
-  }
-
-  if (!urlFgtsCode) throw new Error('Falha no SSO: Não chegou na página do FGTS Digital com o CODE.');
-
-  console.log('[LOGIN] Fase 5: Trocando o Código pelo Token JWT e conectando perfil...')
-  
-  const fgtsUrlObj = new URL(urlFgtsCode);
-  const fgtsCode = fgtsUrlObj.searchParams.get('code');
-  const fgtsState = fgtsUrlObj.searchParams.get('state');
-
-  const headersApiFgts = {
-      'Accept': 'application/json, text/plain, */*',
-      'Content-Type': 'application/json',
-      'User-Agent': headersGovBr['User-Agent'],
-      'Referer': urlFgtsCode,
-      'Origin': 'https://fgtsdigital.sistema.gov.br'
-  }
-
-  const payloadToken = JSON.stringify({ code: fgtsCode, state: fgtsState });
-  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: payloadToken });
-  
-  console.log('[LOGIN] Fase 6: Habilitando Acesso e Sincronizando Perfil...')
-  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersGovBr })
-  await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts })
-
-  console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! 🚀')
-  return { jar, finalUrl: urlFgtsCode, headersApiFgts }
 }
 
 // ======================================================
