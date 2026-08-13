@@ -113,7 +113,7 @@ async function makePfxTls(pfxBase64, password) {
 }
 
 // ======================================================
-// HTTP ENGINE E ISOLAMENTO DE CONEXÃO (O SEGREDO DO MTLS)
+// HTTP ENGINE (Com Keep-Alive para WAF F5)
 // ======================================================
 function newCookieJar() {
   const store = new Map()
@@ -155,18 +155,21 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
 
     const opts = { hostname: url.hostname, port: url.port || (isHttps ? 443 : 80), path: url.pathname + url.search, method, timeout, headers: reqHeaders }
     
-    // ISOLAMENTO TOTAL DO AGENT PARA GARANTIR A ENTREGA DO CERTIFICADO
+    // TRUQUE DO WAF: Usa o GlobalAgent (Keep-Alive) para navegação normal
+    // Só cria o Agent exclusivo quando for injetar o Certificado Digital!
     if (isHttps) {
-        const agentOpts = {
-            rejectUnauthorized: false,
-            secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
-        };
+        opts.rejectUnauthorized = false;
+        opts.secureOptions = crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT;
+        
         if (mtls) {
-            agentOpts.pfx = mtls.pfx;
-            agentOpts.passphrase = mtls.passphrase;
-            agentOpts.keepAlive = false; // Garante que não vai reaproveitar a conexão limpa de antes
+            opts.agent = new https.Agent({
+                rejectUnauthorized: false,
+                secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
+                pfx: mtls.pfx,
+                passphrase: mtls.passphrase,
+                keepAlive: false // Aqui não queremos reaproveitar
+            });
         }
-        opts.agent = new https.Agent(agentOpts);
     }
 
     const reqH = lib.request(opts, (resp) => {
@@ -203,16 +206,21 @@ async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
   const jar = newCookieJar()
   
+  // Cabeçalhos rigorosamente iguais ao Chrome 151 para não irritar o F5
   const headersGovBr = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'Accept-Encoding': 'gzip, deflate, br',
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
     'Connection': 'keep-alive',
+    'Sec-Ch-Ua': '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'document',
     'Sec-Fetch-Mode': 'navigate',
     'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
     'Upgrade-Insecure-Requests': '1',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
   }
 
   console.log('[LOGIN] Fase 1: Coletando cookies e HTML da tela de Login...')
@@ -225,7 +233,7 @@ async function loginGovBr(pfxBase64, password) {
   let baseLoginUrl = '';
   let loginPageHtml = '';
 
-  for(let i = 0; i < 6; i++) {
+  for(let i = 0; i < 8; i++) {
      console.log(`[LOGIN-IDA] GET ${currentUrl.substring(0,80)}...`);
      const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
 
@@ -243,12 +251,14 @@ async function loginGovBr(pfxBase64, password) {
          }
          
          if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
-             console.log(`[WAF] Challenge recebido. Absorvendo cookies...`);
-             await new Promise(r => setTimeout(r, 1000));
+             console.log(`[WAF] Challenge recebido. Aguardando para absorver cookies...`);
+             await new Promise(r => setTimeout(r, 1500));
              const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i) || resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
              if (metaMatch) {
                  let metaUrl = decodeHtmlEntities(metaMatch[1]);
-                 currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
+                 if (metaUrl.length > 5) {
+                    currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
+                 }
              }
              continue;
          }
@@ -261,7 +271,7 @@ async function loginGovBr(pfxBase64, password) {
 
   console.log('[LOGIN] Fase 2: Extraindo Tokens e simulando o clique no Certificado Digital...')
   
-  // Extrai os campos ocultos de segurança da página para enviar junto com o POST
+  // Pega todos os inputs hidden (ex: csrf_token) para simular o formulário perfeitamente
   const hiddenRegex = /<input[^>]+type=["']?hidden["']?[^>]*>/gi;
   const formData = {};
   let m;
@@ -271,21 +281,21 @@ async function loginGovBr(pfxBase64, password) {
       if (nameMatch) formData[nameMatch[1]] = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
   }
   
-  // O GATILHO MÁGICO: Avisa o Serpro que vamos usar o certificado
+  // O GATILHO MÁGICO: Avisa o Serpro que o usuário clicou em "Seu certificado digital"
   formData['login-certificate'] = 'login-certificate';
 
   const postHeaders = { 
       ...headersGovBr, 
       'Content-Type': 'application/x-www-form-urlencoded', 
       'Referer': baseLoginUrl,
-      'Origin': 'https://sso.acesso.gov.br'
+      'Origin': 'https://sso.acesso.gov.br',
+      'Sec-Fetch-Site': 'same-origin'
   };
 
   console.log(`[LOGIN-POST] POST avisando o uso do certificado...`);
   const postResp = await httpRequest(baseLoginUrl, { method: 'POST', jar, headers: postHeaders, body: querystring.stringify(formData) });
 
   let mtlsUrl = '';
-  // O Gov.br DEVE nos redirecionar para a URL do certificado
   if (postResp.status >= 300 && postResp.status < 400 && postResp.location) {
       mtlsUrl = postResp.location.startsWith('http') ? postResp.location : new URL(postResp.location, baseLoginUrl).toString();
   }
@@ -308,6 +318,7 @@ async function loginGovBr(pfxBase64, password) {
   currentUrl = mtlsUrl;
 
   for(let i = 0; i < 4; i++) {
+      // É AQUI que o `mtls` entra em ação criando o Agente isolado
       const respCert = await httpRequest(currentUrl, { method: 'GET', jar, mtls, headers: certHeaders });
 
       if (respCert.status >= 300 && respCert.status < 400 && respCert.location) {
@@ -326,7 +337,6 @@ async function loginGovBr(pfxBase64, password) {
               }
               continue;
           }
-          console.error(`[DEBUG WAF/HTML]:`, respCert.body.substring(0, 300));
           throw new Error(`O Gov.br não autenticou o certificado (Retornou a tela de Login). O túnel ou a senha falharam.`);
       }
 
@@ -362,7 +372,6 @@ async function loginGovBr(pfxBase64, password) {
 
   console.log('[LOGIN] Fase 5: Trocando o Código pelo Token JWT (Sessão Definitiva)...')
   
-  // Extrai o Code e o State da URL para enviar no corpo da requisição (Payload)
   const fgtsUrlObj = new URL(urlFgtsCode);
   const fgtsCode = fgtsUrlObj.searchParams.get('code');
   const fgtsState = fgtsUrlObj.searchParams.get('state');
@@ -406,7 +415,7 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
     const empId = `${cnpjNum.substring(0,8)}1`
     const headers = { 
       'Accept': 'application/json, text/plain, */*', 
-      'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36' 
+      'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36' 
     }
 
     console.log(`[FGTS-RPA] Consultando dados para o Empregador ${empId}...`)
