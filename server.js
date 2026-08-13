@@ -134,6 +134,12 @@ function newCookieJar() {
     },
     header() {
       return Array.from(store.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+    },
+    // Método novo para limpar cookies que causam block no WAF ao mudar de domínio
+    deletePattern(regex) {
+      for (const k of store.keys()) {
+        if (regex.test(k)) store.delete(k);
+      }
     }
   }
 }
@@ -160,15 +166,14 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
         opts.secureOptions = crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT;
         
         if (mtls) {
-            // TÁTICA ANTI-GOV MÁXIMA: TLS 1.2 Cravado + Sem reaproveitamento
+            // Removida a trava rígida de TLS 1.2 que causa block em WAFs modernos.
+            // Injeção limpa de certificado.
             opts.agent = new https.Agent({
                 rejectUnauthorized: false,
                 secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
                 pfx: mtls.pfx,
                 passphrase: mtls.passphrase,
-                keepAlive: false,
-                minVersion: 'TLSv1.2',
-                maxVersion: 'TLSv1.2'
+                keepAlive: false
             });
         }
     }
@@ -207,13 +212,12 @@ async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
   const jar = newCookieJar()
   
-  // SEM "zstd" AQUI para não bugar o Firewall. Headers idênticos ao Chrome 151.
   const headersGovBr = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'Accept-Encoding': 'gzip, deflate, br',
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
     'Connection': 'keep-alive',
-    'Sec-Ch-Ua': '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+    'Sec-Ch-Ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
     'Sec-Ch-Ua-Mobile': '?0',
     'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'document',
@@ -221,7 +225,7 @@ async function loginGovBr(pfxBase64, password) {
     'Sec-Fetch-Site': 'none',
     'Sec-Fetch-User': '?1',
     'Upgrade-Insecure-Requests': '1',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
   }
 
   console.log('[LOGIN] Fase 1: Entrando no Gov.br principal...')
@@ -252,7 +256,7 @@ async function loginGovBr(pfxBase64, password) {
          }
          if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
              console.log(`[WAF] Challenge recebido. Absorvendo cookies e aguardando...`);
-             await new Promise(r => setTimeout(r, 1500)); // Delay para enganar o WAF
+             await new Promise(r => setTimeout(r, 1500)); 
              const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i) || resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
              if (metaMatch) {
                  let metaUrl = decodeHtmlEntities(metaMatch[1]).replace(/['"]/g, '').trim();
@@ -265,40 +269,16 @@ async function loginGovBr(pfxBase64, password) {
      throw new Error(`Erro HTTP ${resp.status} em ${currentUrl}`);
   }
 
-  if (!baseLoginUrl || !loginPageHtml) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
+  if (!baseLoginUrl) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
 
-  console.log('[LOGIN] Fase 2: Simulando clique (POST) no Certificado Digital...')
+  console.log('[LOGIN] Fase 2: Transição para domínio de Certificado (Substituição de URL e Limpeza WAF)...')
   
-  // Extrai formulário CSRF
-  const hiddenRegex = /<input[^>]+type=["']?hidden["']?[^>]*>/gi;
-  const formData = {};
-  let m;
-  while ((m = hiddenRegex.exec(loginPageHtml)) !== null) {
-      const nameMatch = m[0].match(/name=["']([^"']+)["']/i);
-      const valueMatch = m[0].match(/value=["']([^"']*)["']/i);
-      if (nameMatch) formData[nameMatch[1]] = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
-  }
+  // O gov.br usa GET direto no subdomínio de certificado, herdando as variáveis da URL
+  let mtlsUrl = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
   
-  formData['login-certificate'] = 'login-certificate'; // O gatilho oficial do botão
-
-  const postHeaders = { 
-      ...headersGovBr, 
-      'Content-Type': 'application/x-www-form-urlencoded', 
-      'Referer': baseLoginUrl,
-      'Origin': 'https://sso.acesso.gov.br'
-  };
-
-  const postResp = await httpRequest(baseLoginUrl, { method: 'POST', jar, headers: postHeaders, body: querystring.stringify(formData) });
-  console.log(`[LOGIN-POST] Status de resposta do clique: ${postResp.status}`);
-
-  let mtlsUrl = '';
-  if (postResp.status >= 300 && postResp.status < 400 && postResp.location) {
-      mtlsUrl = postResp.location.startsWith('http') ? postResp.location : new URL(postResp.location, baseLoginUrl).toString();
-      console.log(`[LOGIN-POST] Gov.br autorizou! Redirecionando para mTLS...`);
-  } else {
-      console.log(`[LOGIN-POST] Gov.br NÃO enviou 302. Forçando URL mTLS...`);
-      mtlsUrl = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
-  }
+  // Limpamos os cookies do F5/Balanceador antigo para não dar conflito ao cruzar de "sso" para "certificado.sso"
+  jar.deletePattern(/^TS01/);
+  jar.deletePattern(/^TSPD/);
 
   console.log('[LOGIN] Fase 3: Acessando o Endpoint mTLS injetando o Certificado...')
   
@@ -314,14 +294,13 @@ async function loginGovBr(pfxBase64, password) {
   for(let i = 0; i < 4; i++) {
       console.log(`[LOGIN-mTLS] GET ${currentUrl.substring(0, 80)}...`);
       
-      // Envia o mtls aqui para forçar a criação do socket com TLS 1.2
       const respCert = await httpRequest(currentUrl, { method: 'GET', jar, mtls, headers: certHeaders });
 
       console.log(`[LOGIN-mTLS] Recebido Status: ${respCert.status}`);
 
       if (respCert.status >= 300 && respCert.status < 400 && respCert.location) {
           certRedirectUrl = respCert.location.startsWith('http') ? respCert.location : new URL(respCert.location, currentUrl).toString();
-          console.log(`[LOGIN-mTLS] SUCESSO! Certificado lido e validado.`);
+          console.log(`[LOGIN-mTLS] SUCESSO! Certificado validado.`);
           break;
       }
 
@@ -336,7 +315,6 @@ async function loginGovBr(pfxBase64, password) {
               }
               continue;
           }
-          console.error(`\n==== AVISO ==== Gov.br retornou tela de login (200). POST Falhou ou WAF bloqueou Certificado.\n`);
           throw new Error(`O Gov.br rejeitou a validação do certificado (Retornou a tela inicial HTTP 200).`);
       }
 
