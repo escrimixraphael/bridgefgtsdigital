@@ -360,6 +360,8 @@ async function loginGovBr(pfxBase64, password) {
   return { jar, finalUrl: urlFgtsCode, mtls }
 }
 
+ if (!urlFgtsCode) throw new Error('Falha no SSO: Não chegou na página do FGTS Digital com o CODE.');
+
   // 5. CHAMADAS INTERNAS DA API FGTS
   const headersApiFgts = {
       'Accept': 'application/json, text/plain, */*',
