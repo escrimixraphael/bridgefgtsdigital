@@ -10,15 +10,12 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import os from 'node:os'
 import path from 'node:path'
-import fs from 'node:fs/promises'
+import fs from 'node:fs/promises' // <-- Vamos usar apenas 'fs' para promises
 import zlib from 'node:zlib'
-import { chromium } from 'playwright';
-import path from 'node:path';
-import fsPromises from 'node:fs/promises';
-import crypto from 'node:crypto';
-import os from 'node:os';
+import { chromium } from 'playwright'
 
 const execFileAsync = promisify(execFile)
+
 
 const app = express()
 app.use(cors())
