@@ -20,15 +20,12 @@ app.use(cors())
 app.use(express.json({ limit: '50mb' }))
 
 // ======================================================
-// CONFIGURAÇÃO
+// CONFIGURAÇÃO E SEGURANÇA
 // ======================================================
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '9c6c38a65f8052500b7d4c2aff0b87fa'
 const FGTS_API_KEY = process.env.FGTS_API_KEY || '5341b41fa01513c5b3e23f6dc35b8e94'
 const PORT = process.env.PORT || 3000
 
-// ======================================================
-// SEGURANÇA
-// ======================================================
 function apiKeyValida(recebida) {
   if (!recebida) return false
   try {
@@ -36,16 +33,12 @@ function apiKeyValida(recebida) {
     const hashBridge = crypto.createHash('sha256').update(String(BRIDGE_API_KEY)).digest()
     const hashFgts = crypto.createHash('sha256').update(String(FGTS_API_KEY)).digest()
     return crypto.timingSafeEqual(hashRecebido, hashBridge) || crypto.timingSafeEqual(hashRecebido, hashFgts)
-  } catch {
-    return false
-  }
+  } catch { return false }
 }
 
 function requireApiKey(req, res, next) {
   const recebida = req.headers['x-api-key'] || req.headers['fgts-api-key']
-  if (!apiKeyValida(recebida)) {
-    return res.status(403).json({ success: false, error: 'Acesso negado: Chave API inválida ou ausente.' })
-  }
+  if (!apiKeyValida(recebida)) return res.status(403).json({ success: false, error: 'Acesso negado: Chave API inválida.' })
   next()
 }
 
@@ -82,9 +75,7 @@ async function convertLegacyPfx(pfxBuffer, password) {
     const converted = await fs.readFile(outPfx)
     console.log(`[PFX] Reempacotado para AES-256 com sucesso (${converted.length} bytes)`)
     return converted
-  } finally {
-    await cleanup()
-  }
+  } finally { await cleanup() }
 }
 
 async function makePfxTls(pfxBase64, password) {
@@ -102,7 +93,6 @@ async function makePfxTls(pfxBase64, password) {
       const ck = pfxCacheKey(pfxBase64, password)
       const cached = pfxConvCache.get(ck)
       if (cached) return { pfx: cached, passphrase, converted: true }
-
       try {
         console.warn('[PFX] PFX legado detectado — convertendo para AES-256...')
         const convertedPfx = await convertLegacyPfx(pfx, passphrase)
@@ -123,7 +113,7 @@ async function makePfxTls(pfxBase64, password) {
 }
 
 // ======================================================
-// HTTP ENGINE & COOKIE JAR
+// HTTP ENGINE & COOKIE JAR (Corrigido para evitar o 400 Bad Request)
 // ======================================================
 function newCookieJar() {
   const store = new Map()
@@ -133,9 +123,14 @@ function newCookieJar() {
       if (!Array.isArray(setCookieHeaders)) setCookieHeaders = [setCookieHeaders];
       for (const header of setCookieHeaders) {
         if (!header) continue;
-        const [kv] = header.split(';');
-        const eqIdx = kv.indexOf('=');
-        if (eqIdx !== -1) store.set(kv.slice(0, eqIdx).trim(), kv.slice(eqIdx + 1).trim());
+        // O BUG ESTAVA AQUI: Separar o valor real do cookie das diretivas (Path, Secure, HttpOnly)
+        const cookiePart = header.split(';')[0].trim();
+        const eqIdx = cookiePart.indexOf('=');
+        if (eqIdx !== -1) {
+          const k = cookiePart.slice(0, eqIdx).trim();
+          const v = cookiePart.slice(eqIdx + 1).trim();
+          store.set(k, v);
+        }
       }
     },
     header() {
@@ -146,8 +141,7 @@ function newCookieJar() {
 
 function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls = null, timeout = 30000, jar = null } = {}) {
   return new Promise((resolve, reject) => {
-    let url
-    try { url = new URL(urlStr) } catch { return reject(new Error('URL inválida: ' + urlStr)) }
+    let url; try { url = new URL(urlStr) } catch { return reject(new Error('URL inválida: ' + urlStr)) }
     const isHttps = url.protocol === 'https:'
     const lib = isHttps ? https : http
     const reqHeaders = { ...headers }
@@ -160,15 +154,11 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
       reqHeaders['Content-Length'] = Buffer.byteLength(body)
     }
 
-    const opts = {
-      hostname: url.hostname, port: url.port || (isHttps ? 443 : 80), path: url.pathname + url.search,
-      method, rejectUnauthorized: false, timeout, headers: reqHeaders,
-    }
+    const opts = { hostname: url.hostname, port: url.port || (isHttps ? 443 : 80), path: url.pathname + url.search, method, rejectUnauthorized: false, timeout, headers: reqHeaders }
     
     if (mtls) { 
       opts.pfx = mtls.pfx; 
       opts.passphrase = mtls.passphrase; 
-      opts.secureOptions = crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT; 
     }
 
     const reqH = lib.request(opts, (resp) => {
@@ -176,20 +166,15 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, mtls =
       resp.on('data', (c) => chunks.push(c))
       resp.on('end', () => {
         if (jar && resp.headers['set-cookie']) jar.set(resp.headers['set-cookie'])
-        
         const buf = Buffer.concat(chunks)
         let bodyText = ''
         const encoding = resp.headers['content-encoding'] || ''
-        
         try {
-          // Descomprime GZIP/Deflate (Essencial para não cair na malha fina do WAF)
           if (encoding.includes('br')) bodyText = zlib.brotliDecompressSync(buf).toString('utf8')
           else if (encoding.includes('gzip')) bodyText = zlib.gunzipSync(buf).toString('utf8')
           else if (encoding.includes('deflate')) bodyText = zlib.inflateSync(buf).toString('utf8')
           else bodyText = buf.toString('utf8')
-        } catch (e) {
-          bodyText = buf.toString('utf8')
-        }
+        } catch (e) { bodyText = buf.toString('utf8') }
         resolve({ status: resp.statusCode, headers: resp.headers, location: resp.headers.location, body: bodyText })
       })
     })
@@ -204,16 +189,15 @@ function tryParseJson(str) { try { return JSON.parse(str) } catch { return null 
 function decodeHtmlEntities(str) { return String(str).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x2F;/g, '/') }
 
 // ======================================================
-// LOGIN GOV.BR OAUTH2 (Híbrido: Ida cookies -> mTLS API)
+// LOGIN GOV.BR OAUTH2 (Fluxo Humano Perfeito)
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
   const mtls = await makePfxTls(pfxBase64, password)
   const jar = newCookieJar()
   
-  // Headers camuflados perfeitamente (usando gzip/deflate para HTTP/1.1)
   const headersGovBr = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Encoding': 'gzip, deflate', 
+    'Accept-Encoding': 'gzip, deflate',
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
     'Connection': 'keep-alive',
     'Sec-Fetch-Dest': 'document',
@@ -223,20 +207,18 @@ async function loginGovBr(pfxBase64, password) {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
   }
 
+  console.log('[LOGIN] Fase 1: Validando sessão no domínio principal...')
+  
   const nonce = crypto.randomUUID()
   const state = crypto.randomUUID()
-  
-  // URL raiz do SSO (Domínio principal)
   const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`
 
-  console.log('[LOGIN] Fase 1: Entrando no SSO principal para absorver cookies do F5 WAF...')
-  
   let currentUrl = authUrl;
+  let baseLoginUrl = '';
+  let loginPageHtml = '';
 
-  // ==========================================================
-  // 1. IDA (Pegar os Cookies de Segurança TS01)
-  // ==========================================================
-  for(let i = 0; i < 5; i++) {
+  // 1. IDA (Acessar a tela inicial de Login e passar pelo WAF)
+  for(let i = 0; i < 6; i++) {
      console.log(`[LOGIN-IDA] GET ${currentUrl.substring(0,80)}...`);
      const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
 
@@ -247,85 +229,135 @@ async function loginGovBr(pfxBase64, password) {
      }
 
      if (resp.status === 200) {
+         if (currentUrl.includes('/login?client_id=')) {
+             baseLoginUrl = currentUrl;
+             loginPageHtml = resp.body;
+             break;
+         }
+         
          if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
-             console.log(`[WAF] Challenge recebido na Ida. Absorvendo...`);
+             console.log(`[WAF] Challenge recebido. Absorvendo cookies...`);
              await new Promise(r => setTimeout(r, 1000));
              const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i) || 
-                               resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i) ||
-                               resp.body.match(/location\.replace\s*\(\s*["']([^"']+)["']\s*\)/i);
+                               resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
              if (metaMatch) {
                  let metaUrl = decodeHtmlEntities(metaMatch[1]);
                  currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
              }
              continue;
          }
-         // Se chegou aqui (HTTP 200 limpo), passou pelo WAF da Ida com sucesso!
-         break;
+         throw new Error(`Travou numa página desconhecida. HTTP 200. URL: ${currentUrl}`);
      }
      throw new Error(`Erro HTTP ${resp.status} em ${currentUrl}`);
   }
 
+  if (!baseLoginUrl) throw new Error('Falha ao chegar na página HTML de login do Gov.br');
+
   // ==========================================================
-  // 2. MTLS API: Vamos direto pro /authorize com os cookies coletados
+  // 2. EXTRAIR A AÇÃO EXATA DO CERTIFICADO NA PÁGINA
   // ==========================================================
-  console.log(`[LOGIN] Fase 2: Cookies coletados! Iniciando mTLS direto com a API...`);
+  console.log('[LOGIN] Fase 2: Sessão válida! Injetando Certificado mTLS...')
+  let certAction = '';
+  let certMethod = 'GET';
+  let certBody = null;
+
+  // Busca o formulário de login por certificado
+  const certFormRegex = /<form[^>]*id=["']login-certificate["'][^>]*>([\s\S]*?)<\/form>/i;
+  const certFormMatch = loginPageHtml.match(certFormRegex);
+
+  if (certFormMatch) {
+      certMethod = 'POST';
+      const formTag = loginPageHtml.match(/<form[^>]*id=["']login-certificate["'][^>]*>/i)[0];
+      const actionMatch = formTag.match(/action=["']([^"']+)["']/i);
+      
+      certAction = actionMatch ? decodeHtmlEntities(actionMatch[1]) : baseLoginUrl.replace('sso', 'certificado.sso');
+      if (!certAction.startsWith('http')) certAction = new URL(certAction, baseLoginUrl).toString();
+      certAction = certAction.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br'); // Força subdomínio mTLS
+
+      // Pega os tokens CSRF ocultos
+      const fields = {};
+      const hiddenRegex = /<input[^>]+type=["']?hidden["']?[^>]*>/gi;
+      let m;
+      while ((m = hiddenRegex.exec(certFormMatch[1])) !== null) {
+          const nameMatch = m[0].match(/name=["']([^"']+)["']/i);
+          const valueMatch = m[0].match(/value=["']([^"']*)["']/i);
+          if (nameMatch) fields[nameMatch[1]] = valueMatch ? decodeHtmlEntities(valueMatch[1]) : '';
+      }
+      certBody = querystring.stringify(fields);
+  } else {
+      // Se não achar form, constrói URL para GET simples
+      certAction = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
+  }
+
+  console.log(`[LOGIN-mTLS] ${certMethod} ${certAction.substring(0, 80)}...`);
+
+  const certHeaders = {
+      ...headersGovBr,
+      'Content-Type': certMethod === 'POST' ? 'application/x-www-form-urlencoded' : undefined,
+      'Origin': 'https://sso.acesso.gov.br',
+      'Referer': baseLoginUrl,
+      'Sec-Fetch-Site': 'same-site'
+  }
+
+  let certRedirectUrl = '';
   
-  // Pegamos a MESMA URL que iniciamos e mudamos pro subdomínio do certificado
-  const certUrl = authUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
-  currentUrl = certUrl;
+  // 3. ENVIA O CERTIFICADO E ABSORVE WAF DO SUBDOMÍNIO SE EXISTIR
+  currentUrl = certAction;
+  for(let i = 0; i < 4; i++) {
+      const respCert = await httpRequest(currentUrl, { method: certMethod, jar, mtls, headers: certHeaders, body: certBody });
+
+      if (respCert.status >= 300 && respCert.status < 400 && respCert.location) {
+          certRedirectUrl = respCert.location.startsWith('http') ? respCert.location : new URL(respCert.location, currentUrl).toString();
+          break;
+      }
+
+      if (respCert.status === 200) {
+          if (respCert.body.includes('refresh') || respCert.body.includes('TSPD_')) {
+              console.log(`[WAF] Challenge no subdomínio mTLS. Absorvendo...`);
+              await new Promise(r => setTimeout(r, 1000));
+              const metaMatch = respCert.body.match(/url\s*=\s*([^"'>]+)/i) || respCert.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i);
+              if (metaMatch) {
+                  let metaUrl = decodeHtmlEntities(metaMatch[1]);
+                  currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
+                  certMethod = 'GET'; // Desafios WAF geralmente redirecionam via GET
+                  certBody = null;
+              }
+              continue;
+          }
+          throw new Error(`Falha mTLS: Servidor retornou HTML ao invés de redirecionar. (Possível bloqueio de WAF ou certificado inválido)`);
+      }
+
+      if (respCert.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401). Verifique validade e senha.');
+      if (respCert.status === 403) throw new Error('WAF Gov.br bloqueou a requisição mTLS (403).');
+      if (respCert.status === 400) throw new Error(`Gov.br retornou 400 Bad Request no mTLS. O Cookie Jar falhou na sincronia.`);
+      
+      throw new Error(`Falha mTLS: HTTP ${respCert.status}`);
+  }
+
+  if (!certRedirectUrl) throw new Error(`Falha SSO: Não conseguiu redirecionar o mTLS após a injeção.`);
+
+  // 4. LOOP DE VOLTA PARA O FGTS DIGITAL
+  currentUrl = certRedirectUrl;
   let urlFgtsCode = '';
 
-  for(let i = 0; i < 6; i++) {
-     console.log(`[LOGIN-mTLS] GET ${currentUrl.substring(0, 80)}...`);
-     
-     // Sempre envia o Certificado quando estiver no domínio certificado.sso
-     const isCertDomain = currentUrl.includes('certificado.sso');
-     const reqMtls = isCertDomain ? mtls : null;
-
-     const resp = await httpRequest(currentUrl, { method: 'GET', jar, mtls: reqMtls, headers: headersGovBr });
+  for(let i = 0; i < 5; i++) {
+     console.log(`[LOGIN-VOLTA] GET ${currentUrl.substring(0,80)}...`);
+     const resp = await httpRequest(currentUrl, { method: 'GET', jar, headers: headersGovBr });
 
      if (resp.status >= 300 && resp.status < 400 && resp.location) {
          currentUrl = resp.location.startsWith('http') ? resp.location : new URL(resp.location, currentUrl).toString();
          continue;
      }
 
-     if (resp.status === 200) {
-         // Chegamos na tela final de sucesso do FGTS Digital?
-         if (currentUrl.includes('code=') || currentUrl.includes('acessogov')) {
-             urlFgtsCode = currentUrl;
-             break;
-         }
-
-         // Se o subdomínio tiver um WAF próprio
-         if (resp.body.includes('refresh') || resp.body.includes('TSPD_')) {
-             console.log(`[WAF] Challenge recebido no Certificado. Absorvendo...`);
-             await new Promise(r => setTimeout(r, 1000));
-             const metaMatch = resp.body.match(/url\s*=\s*([^"'>]+)/i) || 
-                               resp.body.match(/window\.location\.href\s*=\s*["']([^"']+)["']/i) ||
-                               resp.body.match(/location\.replace\s*\(\s*["']([^"']+)["']\s*\)/i);
-             if (metaMatch) {
-                 let metaUrl = decodeHtmlEntities(metaMatch[1]);
-                 currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
-             }
-             continue;
-         }
-
-         console.error(`[DEBUG mTLS] HTML Inesperado (O certificado falhou silenciosamente):`, resp.body.substring(0, 500));
-         throw new Error(`Falha mTLS: Gov.br retornou HTML 200 em vez do código de acesso. O Certificado pode estar revogado ou sem permissão.`);
+     if (resp.status === 200 && (currentUrl.includes('code=') || currentUrl.includes('acessogov'))) {
+         urlFgtsCode = currentUrl;
+         break;
      }
-
-     if (resp.status === 401) throw new Error('Certificado rejeitado pelo Gov.br (Erro 401). Verifique validade e senha.');
-     if (resp.status === 403) throw new Error('WAF Gov.br bloqueou a requisição mTLS (403). Falha no cookie ou IP barrado.');
-     if (resp.status === 400) throw new Error(`Gov.br retornou 400 Bad Request no mTLS.`);
-
-     throw new Error(`Erro HTTP ${resp.status} na URL: ${currentUrl}`);
   }
 
   if (!urlFgtsCode) throw new Error('Falha no SSO: Não chegou na página do FGTS Digital com o CODE.');
 
-  // ==========================================================
-  // 3. CHAMADAS INTERNAS DA API FGTS
-  // ==========================================================
+  // 5. CHAMADAS INTERNAS DA API FGTS
   const headersApiFgts = {
       'Accept': 'application/json, text/plain, */*',
       'Content-Type': 'application/json',
