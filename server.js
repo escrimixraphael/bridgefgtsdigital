@@ -113,7 +113,7 @@ async function makePfxTls(pfxBase64, password) {
 }
 
 // ======================================================
-// HTTP ENGINE & COOKIE JAR (Corrigido para evitar o 400 Bad Request)
+// HTTP ENGINE & COOKIE JAR
 // ======================================================
 function newCookieJar() {
   const store = new Map()
@@ -123,7 +123,6 @@ function newCookieJar() {
       if (!Array.isArray(setCookieHeaders)) setCookieHeaders = [setCookieHeaders];
       for (const header of setCookieHeaders) {
         if (!header) continue;
-        // O BUG ESTAVA AQUI: Separar o valor real do cookie das diretivas (Path, Secure, HttpOnly)
         const cookiePart = header.split(';')[0].trim();
         const eqIdx = cookiePart.indexOf('=');
         if (eqIdx !== -1) {
@@ -261,7 +260,6 @@ async function loginGovBr(pfxBase64, password) {
   let certMethod = 'GET';
   let certBody = null;
 
-  // Busca o formulário de login por certificado
   const certFormRegex = /<form[^>]*id=["']login-certificate["'][^>]*>([\s\S]*?)<\/form>/i;
   const certFormMatch = loginPageHtml.match(certFormRegex);
 
@@ -272,9 +270,8 @@ async function loginGovBr(pfxBase64, password) {
       
       certAction = actionMatch ? decodeHtmlEntities(actionMatch[1]) : baseLoginUrl.replace('sso', 'certificado.sso');
       if (!certAction.startsWith('http')) certAction = new URL(certAction, baseLoginUrl).toString();
-      certAction = certAction.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br'); // Força subdomínio mTLS
+      certAction = certAction.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br'); 
 
-      // Pega os tokens CSRF ocultos
       const fields = {};
       const hiddenRegex = /<input[^>]+type=["']?hidden["']?[^>]*>/gi;
       let m;
@@ -285,7 +282,6 @@ async function loginGovBr(pfxBase64, password) {
       }
       certBody = querystring.stringify(fields);
   } else {
-      // Se não achar form, constrói URL para GET simples
       certAction = baseLoginUrl.replace('sso.acesso.gov.br', 'certificado.sso.acesso.gov.br');
   }
 
@@ -293,10 +289,14 @@ async function loginGovBr(pfxBase64, password) {
 
   const certHeaders = {
       ...headersGovBr,
-      'Content-Type': certMethod === 'POST' ? 'application/x-www-form-urlencoded' : undefined,
       'Origin': 'https://sso.acesso.gov.br',
       'Referer': baseLoginUrl,
       'Sec-Fetch-Site': 'same-site'
+  }
+  
+  // SÓ adiciona Content-Type se for POST. Corrige o erro "undefined header".
+  if (certMethod === 'POST') {
+      certHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
   }
 
   let certRedirectUrl = '';
@@ -319,7 +319,7 @@ async function loginGovBr(pfxBase64, password) {
               if (metaMatch) {
                   let metaUrl = decodeHtmlEntities(metaMatch[1]);
                   currentUrl = metaUrl.startsWith('http') ? metaUrl : new URL(metaUrl, currentUrl).toString();
-                  certMethod = 'GET'; // Desafios WAF geralmente redirecionam via GET
+                  certMethod = 'GET'; 
                   certBody = null;
               }
               continue;
