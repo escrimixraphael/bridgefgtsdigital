@@ -195,7 +195,11 @@ async function loginGovBr(pfxBase64, password) {
     const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`;
 
     await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
-    console.log('[LOGIN] Passo 4 OK: Página do Governo carregada.');
+    
+    console.log('[LOGIN] Aguardando redirecionamento interno do Serpro gerar a sessão...');
+    // CORREÇÃO CRÍTICA: Obriga o robô a esperar a URL receber o authorization_id antes de continuar
+    await page.waitForURL(/authorization_id=/, { timeout: 30000 });
+    console.log('[LOGIN] Passo 4 OK: Página do Governo carregada e sessão confirmada.');
 
     console.log('[LOGIN] Passo 5: Evadindo o hCaptcha através de Salto Direto (Bypass)...');
     
@@ -207,22 +211,20 @@ async function loginGovBr(pfxBase64, password) {
         const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
         console.log(`[LOGIN] Passo 5 OK: Saltando direto para o motor de certificados...`);
         
-        // Simula que viemos da página oficial para não levantar suspeitas
         await page.setExtraHTTPHeaders({ 'Referer': page.url() });
 
-        // Amortecedor de Proxy: Tenta a conexão SOCKS até 3 vezes se falhar
+        // Amortecedor de Proxy SOCKS: Tenta a conexão mTLS até 3 vezes se falhar
         let successJump = false;
         for(let tentativa = 1; tentativa <= 3; tentativa++) {
             try {
                 console.log(`[LOGIN] Tentativa de conexão mTLS via Proxy (SOCKS) ${tentativa}/3...`);
-                // Mudamos de networkidle para domcontentloaded para o proxy não travar a espera
                 await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
                 successJump = true;
-                console.log(`[LOGIN] Conexão SOCKS estabelecida com sucesso!`);
+                console.log(`[LOGIN] Conexão mTLS/SOCKS estabelecida com sucesso!`);
                 break;
             } catch(e) {
                 console.log(`[LOGIN-AVISO] O Proxy falhou na tentativa ${tentativa}: ${e.message}`);
-                await page.waitForTimeout(3000); // Espera 3s o túnel SOCKS respirar
+                if (tentativa < 3) await page.waitForTimeout(3000); 
             }
         }
 
@@ -231,7 +233,7 @@ async function loginGovBr(pfxBase64, password) {
         }
 
     } else {
-        console.log('[LOGIN] ERRO: authorization_id não encontrado na URL. Tentando clique bruto...');
+        console.log('[LOGIN] ERRO: authorization_id não encontrado na URL após a espera. Tentando clique...');
         await page.getByText('Seu certificado digital').first().click({ force: true });
     }
 
@@ -293,7 +295,6 @@ async function loginGovBr(pfxBase64, password) {
     throw error;
   }
 }
-
 
 
 // ======================================================
