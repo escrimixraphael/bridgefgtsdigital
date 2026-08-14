@@ -92,40 +92,40 @@ async function httpRequest(url, options) {
 async function makePfxTls(pfxBase64, password) {
   const pfxBuffer = Buffer.from(pfxBase64, 'base64');
   
+  console.log('[LOGIN] Forçando modernização da criptografia do certificado para o padrão AES-256...');
+  
+  const tmpDir = os.tmpdir();
+  const tmpId = crypto.randomUUID();
+  const inPath = path.join(tmpDir, `in_${tmpId}.pfx`);
+  const outPath = path.join(tmpDir, `out_${tmpId}.pfx`);
+  
+  await fs.writeFile(inPath, pfxBuffer);
+  
   try {
-    // Tenta validar o formato nativamente. Se passar, o certificado já é AES-256
-    await import('node:crypto').then(c => c.createSecureContext({ pfx: pfxBuffer, passphrase: password })).catch(()=>{});
+    // Comando mágico: Lê permitindo certificados velhos (-legacy) e exporta FORÇANDO o padrão AES-256 exigido pelo Playwright
+    const cmd = `openssl pkcs12 -in "${inPath}" -nodes -legacy -passin env:PFX_PASS | openssl pkcs12 -export -out "${outPath}" -passout env:PFX_PASS -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg SHA256`;
+    
+    execSync(cmd, { stdio: 'ignore', env: { ...process.env, PFX_PASS: password } }); 
+    
+    const modernBuffer = await fs.readFile(outPath);
+    
+    // Limpa os arquivos temporários
+    await fs.unlink(inPath).catch(() => {});
+    await fs.unlink(outPath).catch(() => {});
+    
+    console.log('[LOGIN] Certificado convertido com sucesso para AES-256!');
+    return { pfx: modernBuffer, passphrase: password };
+    
+  } catch (sslErr) {
+    // Se o OpenSSL falhar, é porque o certificado não precisa do modo "-legacy". Usamos o original.
+    console.log('[LOGIN-AVISO] Certificado já é moderno ou não requer conversão. Usando o original.');
+    await fs.unlink(inPath).catch(() => {});
+    await fs.unlink(outPath).catch(() => {});
+    
     return { pfx: pfxBuffer, passphrase: password };
-  } catch (err) {
-    console.log('[LOGIN] Certificado antigo detectado. Atualizando criptografia via OpenSSL...');
-    
-    const tmpDir = os.tmpdir();
-    const tmpId = crypto.randomUUID();
-    const inPath = path.join(tmpDir, `in_${tmpId}.pfx`);
-    const outPath = path.join(tmpDir, `out_${tmpId}.pfx`);
-    
-    await fs.writeFile(inPath, pfxBuffer);
-    
-    try {
-      const cmd = `openssl pkcs12 -in "${inPath}" -nodes -legacy -passin env:PFX_PASS | openssl pkcs12 -export -out "${outPath}" -passout env:PFX_PASS`;
-      
-      execSync(cmd, { stdio: 'ignore', env: { ...process.env, PFX_PASS: password } }); 
-      
-      const modernBuffer = await fs.readFile(outPath);
-      
-      await fs.unlink(inPath).catch(() => {});
-      await fs.unlink(outPath).catch(() => {});
-      
-      console.log('[LOGIN] Certificado modernizado com sucesso!');
-      return { pfx: modernBuffer, passphrase: password };
-    } catch (sslErr) {
-      console.error('[LOGIN-ERRO] Falha na conversão:', sslErr);
-      await fs.unlink(inPath).catch(() => {});
-      await fs.unlink(outPath).catch(() => {});
-      throw new Error('Não foi possível modernizar o certificado. Verifique a senha.');
-    }
   }
 }
+
 
 // ======================================================
 // LOGIN GOV.BR E FGTS DIGITAL (VIA PLAYWRIGHT - BYPASS WAF)
