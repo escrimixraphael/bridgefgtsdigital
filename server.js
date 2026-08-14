@@ -171,6 +171,7 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
     browser = await chromium.launchPersistentContext('', {
       headless: true,
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
       args: [
         '--no-sandbox', 
         '--disable-blink-features=AutomationControlled', 
@@ -181,19 +182,12 @@ async function loginGovBr(pfxBase64, password) {
       ignoreHTTPSErrors: true,
       clientCertificates: [
         { origin: 'https://sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
-        { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
-        { origin: 'https://trust.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
+        { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
       ]
     });
     console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
 
     page = browser.pages()[0] || await browser.newPage();
-
-    // Camuflagem extra para o WAF não bloquear os botões da página
-    await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.navigator.chrome = { runtime: {} };
-    });
 
     console.log('[LOGIN] Passo 4: Acessando URL de autorização do Gov.br...');
     const nonce = crypto.randomUUID();
@@ -201,38 +195,24 @@ async function loginGovBr(pfxBase64, password) {
     const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`;
 
     await page.goto(authUrl, { waitUntil: 'networkidle', timeout: 90000 });
-    console.log('[LOGIN] Passo 4 OK: Página do Governo carregada (WAF superado).');
+    console.log('[LOGIN] Passo 4 OK: Página do Governo carregada.');
 
-    // Logs profundos de rede para entendermos o que acontece na hora do clique
-    page.on('framenavigated', frame => {
-       if (frame === page.mainFrame()) console.log(`[LOGIN-REDIRECIONAMENTO] Navegador foi para: ${frame.url()}`);
-    });
-    page.on('request', req => {
-       const u = req.url();
-       if (u.includes('acesso.gov.br') && !u.includes('.js') && !u.includes('.css') && !u.includes('.svg') && !u.includes('.png')) {
-           console.log(`[DEBUG-REDE] REQ -> ${req.method()} ${u}`);
-       }
-    });
-
-    console.log('[LOGIN] Passo 5: Estabilizando JS e injetando clique direto no sistema...');
+    console.log('[LOGIN] Passo 5: Evadindo o hCaptcha através de Salto Direto (Bypass)...');
     
-    // O Gov.br é pesado. Esperamos 3 segundos para garantir que o botão está "clicável" internamente.
-    await page.waitForTimeout(3000); 
+    // Captura a URL atual e extrai os códigos necessários
+    const currentUrl = new URL(page.url());
+    const authId = currentUrl.searchParams.get('authorization_id');
+    const clientId = currentUrl.searchParams.get('client_id');
 
-    // GOLPE MASTER: Força o clique rodando diretamente dentro do navegador do usuário
-    const clickInjetado = await page.evaluate(() => {
-        const btn = document.getElementById('login-certificate') || document.querySelector('button[data-sso-type="certificate"]');
-        if (btn) {
-            btn.click();
-            return true;
-        }
-        return false;
-    });
-
-    if (clickInjetado) {
-        console.log('[LOGIN] Passo 5 OK: Clique executado cirurgicamente pelo Javascript da página.');
+    if (authId && clientId) {
+        // Constrói a URL do servidor de certificados, burlando o clique no botão
+        const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
+        console.log(`[LOGIN] Passo 5 OK: Saltando direto para o motor de certificados...`);
+        
+        // Navega direto para lá. Isso vai forçar o mTLS sem CAPTCHA!
+        await page.goto(certUrl, { waitUntil: 'networkidle', timeout: 60000 });
     } else {
-        console.log('[LOGIN] Botão não achado via JS. Tentativa alternativa...');
+        console.log('[LOGIN] ERRO: authorization_id não encontrado na URL. Tentando clique bruto...');
         await page.getByText('Seu certificado digital').first().click({ force: true });
     }
 
@@ -258,7 +238,7 @@ async function loginGovBr(pfxBase64, password) {
     const headersApiFgts = {
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
         'Referer': urlFgtsCode,
         'Origin': 'https://fgtsdigital.sistema.gov.br'
     };
