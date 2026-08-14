@@ -171,13 +171,12 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
     browser = await chromium.launchPersistentContext('', {
       headless: true,
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       args: [
         '--no-sandbox', 
         '--disable-blink-features=AutomationControlled', 
         '--disable-dev-shm-usage', 
-        '--disable-gpu',
-        '--disable-web-security'
+        '--disable-gpu'
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
@@ -197,7 +196,6 @@ async function loginGovBr(pfxBase64, password) {
     await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
     
     console.log('[LOGIN] Aguardando redirecionamento interno do Serpro gerar a sessão...');
-    // CORREÇÃO CRÍTICA: Obriga o robô a esperar a URL receber o authorization_id antes de continuar
     await page.waitForURL(/authorization_id=/, { timeout: 30000 });
     console.log('[LOGIN] Passo 4 OK: Página do Governo carregada e sessão confirmada.');
 
@@ -211,25 +209,38 @@ async function loginGovBr(pfxBase64, password) {
         const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
         console.log(`[LOGIN] Passo 5 OK: Saltando direto para o motor de certificados...`);
         
-        await page.setExtraHTTPHeaders({ 'Referer': page.url() });
+        await page.setExtraHTTPHeaders({ 'Referer': 'https://sso.acesso.gov.br/' });
 
-        // Amortecedor de Proxy SOCKS: Tenta a conexão mTLS até 3 vezes se falhar
+        // AMORTECEDOR DE PROXY BLINDADO: 6 tentativas rápidas com reset de socket
         let successJump = false;
-        for(let tentativa = 1; tentativa <= 3; tentativa++) {
+        for(let tentativa = 1; tentativa <= 6; tentativa++) {
             try {
-                console.log(`[LOGIN] Tentativa de conexão mTLS via Proxy (SOCKS) ${tentativa}/3...`);
-                await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+                console.log(`[LOGIN] Tentativa de conexão mTLS via Proxy (SOCKS) ${tentativa}/6...`);
+                
+                // Falha rápido (15s) para não ficar travado no túnel quebrado
+                await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                
+                // Ocasionalmente o Playwright engole o erro SOCKS e mostra a tela do dinossauro
+                if (page.url().includes('chrome-error://')) {
+                    throw new Error("Proxy SOCKS cortou o túnel TCP silenciosamente.");
+                }
+                
                 successJump = true;
                 console.log(`[LOGIN] Conexão mTLS/SOCKS estabelecida com sucesso!`);
                 break;
             } catch(e) {
-                console.log(`[LOGIN-AVISO] O Proxy falhou na tentativa ${tentativa}: ${e.message}`);
-                if (tentativa < 3) await page.waitForTimeout(3000); 
+                console.log(`[LOGIN-AVISO] O Proxy derrubou a conexão na tentativa ${tentativa}: ${e.message}`);
+                if (tentativa < 6) {
+                    console.log(`[LOGIN] Forçando recriação do túnel TCP no GoSkip...`);
+                    // O pulo do gato: ir para about:blank destrói as conexões Keep-Alive pendentes (sockets sujos)
+                    await page.goto('about:blank').catch(() => {});
+                    await page.waitForTimeout(2000); // Dá um respiro para o servidor de proxy
+                }
             }
         }
 
         if(!successJump) {
-            throw new Error("O túnel SOCKS do GoSkip recusou a conexão mTLS repetidamente.");
+            throw new Error("O túnel SOCKS do GoSkip recusou a conexão mTLS 6 vezes seguidas.");
         }
 
     } else {
@@ -259,7 +270,7 @@ async function loginGovBr(pfxBase64, password) {
     const headersApiFgts = {
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Referer': urlFgtsCode,
         'Origin': 'https://fgtsdigital.sistema.gov.br'
     };
