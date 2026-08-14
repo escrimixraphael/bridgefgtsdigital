@@ -176,7 +176,8 @@ async function loginGovBr(pfxBase64, password) {
         '--no-sandbox', 
         '--disable-blink-features=AutomationControlled', 
         '--disable-dev-shm-usage', 
-        '--disable-gpu'
+        '--disable-gpu',
+        '--no-proxy-server' // FLAG MÁGICA: Corta qualquer túnel/SOCKS fantasma na nuvem e força saída direta
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
@@ -184,7 +185,7 @@ async function loginGovBr(pfxBase64, password) {
         { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
       ]
     });
-    console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
+    console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso (Modo Direto Ativado)!');
 
     page = browser.pages()[0] || await browser.newPage();
 
@@ -207,41 +208,13 @@ async function loginGovBr(pfxBase64, password) {
 
     if (authId && clientId) {
         const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
-        console.log(`[LOGIN] Passo 5 OK: Saltando direto para o motor de certificados...`);
+        console.log(`[LOGIN] Passo 5 OK: Saltando direto para o motor de certificados (SEM PROXY)...`);
         
         await page.setExtraHTTPHeaders({ 'Referer': 'https://sso.acesso.gov.br/' });
 
-        // AMORTECEDOR DE PROXY BLINDADO: 6 tentativas rápidas com reset de socket
-        let successJump = false;
-        for(let tentativa = 1; tentativa <= 6; tentativa++) {
-            try {
-                console.log(`[LOGIN] Tentativa de conexão mTLS via Proxy (SOCKS) ${tentativa}/6...`);
-                
-                // Falha rápido (15s) para não ficar travado no túnel quebrado
-                await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                
-                // Ocasionalmente o Playwright engole o erro SOCKS e mostra a tela do dinossauro
-                if (page.url().includes('chrome-error://')) {
-                    throw new Error("Proxy SOCKS cortou o túnel TCP silenciosamente.");
-                }
-                
-                successJump = true;
-                console.log(`[LOGIN] Conexão mTLS/SOCKS estabelecida com sucesso!`);
-                break;
-            } catch(e) {
-                console.log(`[LOGIN-AVISO] O Proxy derrubou a conexão na tentativa ${tentativa}: ${e.message}`);
-                if (tentativa < 6) {
-                    console.log(`[LOGIN] Forçando recriação do túnel TCP no GoSkip...`);
-                    // O pulo do gato: ir para about:blank destrói as conexões Keep-Alive pendentes (sockets sujos)
-                    await page.goto('about:blank').catch(() => {});
-                    await page.waitForTimeout(2000); // Dá um respiro para o servidor de proxy
-                }
-            }
-        }
-
-        if(!successJump) {
-            throw new Error("O túnel SOCKS do GoSkip recusou a conexão mTLS 6 vezes seguidas.");
-        }
+        // Conexão direta e limpa!
+        await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        console.log(`[LOGIN] Conexão mTLS direta estabelecida com sucesso!`);
 
     } else {
         console.log('[LOGIN] ERRO: authorization_id não encontrado na URL após a espera. Tentando clique...');
@@ -306,7 +279,6 @@ async function loginGovBr(pfxBase64, password) {
     throw error;
   }
 }
-
 
 // ======================================================
 // ROTA 1: Extrato FGTS Digital (Guias e Valores)
