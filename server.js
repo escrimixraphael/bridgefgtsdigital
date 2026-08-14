@@ -1,20 +1,11 @@
 import express from 'express'
-import https from 'node:https'
-import http from 'node:http'
-import tls from 'node:tls'
 import cors from 'cors'
 import crypto from 'node:crypto'
-import { Buffer } from 'node:buffer'
-import querystring from 'node:querystring'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs/promises'
-import zlib from 'node:zlib'
+import { execSync } from 'node:child_process'
 import { chromium } from 'playwright'
-
-const execFileAsync = promisify(execFile)
 
 const app = express()
 app.use(cors())
@@ -25,7 +16,7 @@ app.use(express.json({ limit: '50mb' }))
 // ======================================================
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '9c6c38a65f8052500b7d4c2aff0b87fa'
 const FGTS_API_KEY = process.env.FGTS_API_KEY || '5341b41fa01513c5b3e23f6dc35b8e94'
-const PORT = process.env.PORT || 3000
+const PORT = process.env.PORT || 10000
 
 function apiKeyValida(recebida) {
   if (!recebida) return false
@@ -49,6 +40,91 @@ function classifyError(err, stage) {
   if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão ao acessar Gov.br/FGTS.' }
   if (code.startsWith('ERR_TLS') || /handshake|alert|SSL routines/i.test(msg)) return { errorType: 'TLS_HANDSHAKE_ERROR', stage, code: code || 'TLS', message: 'Falha no handshake TLS (Certificado).' }
   return { errorType: 'BRIDGE_INTERNAL', stage, code: code || 'UNKNOWN', message: msg, raw: msg }
+}
+
+// ======================================================
+// FUNÇÕES AUXILIARES (HTTP e JSON)
+// ======================================================
+function tryParseJson(str) {
+  try { return JSON.parse(str); } catch (e) { return str; }
+}
+
+function newCookieJar() {
+  return {
+    cookies: new Map(),
+    set(cookieArray) {
+      cookieArray.forEach(c => {
+        if (!c) return;
+        const [nameValue] = c.split(';');
+        const [name, ...valParts] = nameValue.split('=');
+        if (name && valParts) this.cookies.set(name.trim(), valParts.join('='));
+      });
+    },
+    getCookieString() {
+      let str = '';
+      for (const [name, value] of this.cookies.entries()) {
+        str += `${name}=${value}; `;
+      }
+      return str;
+    },
+    extractFromResponse(headers) {
+      const setCookie = headers.getSetCookie ? headers.getSetCookie() : [];
+      this.set(Array.isArray(setCookie) ? setCookie : [setCookie]);
+    }
+  };
+}
+
+async function httpRequest(url, options) {
+  const fetchOpts = { method: options.method || 'GET', headers: { ...options.headers } };
+  if (options.jar) fetchOpts.headers['Cookie'] = options.jar.getCookieString();
+  if (options.body) fetchOpts.body = options.body;
+
+  const response = await fetch(url, fetchOpts);
+  if (options.jar) options.jar.extractFromResponse(response.headers);
+  const text = await response.text();
+  
+  return { status: response.status, headers: response.headers, body: text };
+}
+
+// ======================================================
+// CONVERSOR DE CERTIFICADO LEGADO PARA O PLAYWRIGHT
+// ======================================================
+async function makePfxTls(pfxBase64, password) {
+  const pfxBuffer = Buffer.from(pfxBase64, 'base64');
+  
+  try {
+    // Tenta validar o formato nativamente. Se passar, o certificado já é AES-256
+    await import('node:crypto').then(c => c.createSecureContext({ pfx: pfxBuffer, passphrase: password })).catch(()=>{});
+    return { pfx: pfxBuffer, passphrase: password };
+  } catch (err) {
+    console.log('[LOGIN] Certificado antigo detectado. Atualizando criptografia via OpenSSL...');
+    
+    const tmpDir = os.tmpdir();
+    const tmpId = crypto.randomUUID();
+    const inPath = path.join(tmpDir, `in_${tmpId}.pfx`);
+    const outPath = path.join(tmpDir, `out_${tmpId}.pfx`);
+    
+    await fs.writeFile(inPath, pfxBuffer);
+    
+    try {
+      const cmd = `openssl pkcs12 -in "${inPath}" -nodes -legacy -passin env:PFX_PASS | openssl pkcs12 -export -out "${outPath}" -passout env:PFX_PASS`;
+      
+      execSync(cmd, { stdio: 'ignore', env: { ...process.env, PFX_PASS: password } }); 
+      
+      const modernBuffer = await fs.readFile(outPath);
+      
+      await fs.unlink(inPath).catch(() => {});
+      await fs.unlink(outPath).catch(() => {});
+      
+      console.log('[LOGIN] Certificado modernizado com sucesso!');
+      return { pfx: modernBuffer, passphrase: password };
+    } catch (sslErr) {
+      console.error('[LOGIN-ERRO] Falha na conversão:', sslErr);
+      await fs.unlink(inPath).catch(() => {});
+      await fs.unlink(outPath).catch(() => {});
+      throw new Error('Não foi possível modernizar o certificado. Verifique a senha.');
+    }
+  }
 }
 
 // ======================================================
@@ -141,7 +217,6 @@ async function loginGovBr(pfxBase64, password) {
     throw error;
   }
 }
-
 
 // ======================================================
 // ROTA 1: Extrato FGTS Digital (Guias e Valores)
