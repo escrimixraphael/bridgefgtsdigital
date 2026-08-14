@@ -147,7 +147,6 @@ async function makePfxTls(pfxBase64, password) {
   }
 }
 
-
 // ======================================================
 // LOGIN GOV.BR E FGTS DIGITAL (VIA PLAYWRIGHT - BYPASS WAF)
 // ======================================================
@@ -155,6 +154,7 @@ async function loginGovBr(pfxBase64, password) {
   console.log('[LOGIN] Iniciando motor blindado (Playwright) para bypass do WAF...');
 
   let browser;
+  let page; // Declarando page aqui fora para o catch conseguir ler a URL de erro
   const tmpDir = os.tmpdir();
   const certId = crypto.randomUUID();
   const certPath = path.join(tmpDir, `cert_${certId}.pfx`);
@@ -181,21 +181,23 @@ async function loginGovBr(pfxBase64, password) {
     });
     console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
 
-    const page = browser.pages()[0] || await browser.newPage();
+    page = browser.pages()[0] || await browser.newPage();
 
     console.log('[LOGIN] Passo 4: Acessando URL de autorização do Gov.br...');
     const nonce = crypto.randomUUID();
     const state = crypto.randomUUID();
     const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`;
 
-    await page.goto(authUrl, { waitUntil: 'networkidle', timeout: 45000 });
+    // Aumentamos o tempo de espera do carregamento inicial do Gov.br para 90s
+    await page.goto(authUrl, { waitUntil: 'networkidle', timeout: 90000 });
     console.log('[LOGIN] Passo 4 OK: Página do Governo carregada (WAF superado).');
 
     console.log('[LOGIN] Passo 5: Clicando no botão do Certificado Digital...');
     await page.locator('button:has-text("Seu certificado digital"), a:has-text("Seu certificado digital"), [data-sso-type="certificate"]').first().click();
 
     console.log('[LOGIN] Passo 6: Aguardando redirecionamento com código mTLS...');
-    await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 60000 });
+    // Aumentamos o tempo de espera do redirecionamento do Serpro para 150s (respeitando o limite de 180s do GoSkip)
+    await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 150000 });
     
     const urlFgtsCode = page.url();
     console.log('[LOGIN] Passo 6 OK: SUCESSO! Código capturado:', urlFgtsCode.substring(0, 70) + '...');
@@ -233,6 +235,9 @@ async function loginGovBr(pfxBase64, password) {
 
   } catch (error) {
     console.error('[LOGIN-ERRO]', error);
+    // Log de debug adicionado para mostrar onde a página travou antes do timeout
+    if (page) console.log('[DEBUG] A página travou nesta URL:', page.url());
+    
     if (browser) await browser.close().catch(() => {});
     await fs.unlink(certPath).catch(() => {});
     throw error;
