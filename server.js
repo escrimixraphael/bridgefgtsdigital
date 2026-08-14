@@ -171,16 +171,29 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
     browser = await chromium.launchPersistentContext('', {
       headless: true,
-      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--disable-gpu'], 
+      args: [
+        '--no-sandbox', 
+        '--disable-blink-features=AutomationControlled', 
+        '--disable-dev-shm-usage', 
+        '--disable-gpu',
+        '--disable-web-security'
+      ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
         { origin: 'https://sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
-        { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
+        { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
+        { origin: 'https://trust.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
       ]
     });
     console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
 
     page = browser.pages()[0] || await browser.newPage();
+
+    // Camuflagem extra para o WAF não bloquear os botões da página
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.navigator.chrome = { runtime: {} };
+    });
 
     console.log('[LOGIN] Passo 4: Acessando URL de autorização do Gov.br...');
     const nonce = crypto.randomUUID();
@@ -190,25 +203,38 @@ async function loginGovBr(pfxBase64, password) {
     await page.goto(authUrl, { waitUntil: 'networkidle', timeout: 90000 });
     console.log('[LOGIN] Passo 4 OK: Página do Governo carregada (WAF superado).');
 
-    console.log('[LOGIN] Passo 5: Localizando e clicando no botão do Certificado Digital...');
-    
-    // GOLPE BLINDADO: Tenta pelo ID oficial primeiro (com 20s de paciência)
-    const btnID = page.locator('#login-certificate');
-    try {
-        await btnID.waitFor({ state: 'visible', timeout: 20000 });
-        await btnID.click({ force: true });
-        console.log('[LOGIN] Passo 5 OK: Clique executado via ID do botão.');
-    } catch (e) {
-        console.log('[LOGIN] ID não visível a tempo. Tentando clique genérico por texto...');
-        // Se falhar, manda o Playwright achar o texto na marra e clicar
-        await page.getByText('Seu certificado digital').first().click({ force: true });
-        console.log('[LOGIN] Passo 5 OK: Clique executado via texto na tela.');
-    }
-
-    // Monitoramento de segurança
+    // Logs profundos de rede para entendermos o que acontece na hora do clique
     page.on('framenavigated', frame => {
-       if (frame === page.mainFrame()) console.log(`[LOGIN-REDIRECIONAMENTO] O navegador foi para: ${frame.url()}`);
+       if (frame === page.mainFrame()) console.log(`[LOGIN-REDIRECIONAMENTO] Navegador foi para: ${frame.url()}`);
     });
+    page.on('request', req => {
+       const u = req.url();
+       if (u.includes('acesso.gov.br') && !u.includes('.js') && !u.includes('.css') && !u.includes('.svg') && !u.includes('.png')) {
+           console.log(`[DEBUG-REDE] REQ -> ${req.method()} ${u}`);
+       }
+    });
+
+    console.log('[LOGIN] Passo 5: Estabilizando JS e injetando clique direto no sistema...');
+    
+    // O Gov.br é pesado. Esperamos 3 segundos para garantir que o botão está "clicável" internamente.
+    await page.waitForTimeout(3000); 
+
+    // GOLPE MASTER: Força o clique rodando diretamente dentro do navegador do usuário
+    const clickInjetado = await page.evaluate(() => {
+        const btn = document.getElementById('login-certificate') || document.querySelector('button[data-sso-type="certificate"]');
+        if (btn) {
+            btn.click();
+            return true;
+        }
+        return false;
+    });
+
+    if (clickInjetado) {
+        console.log('[LOGIN] Passo 5 OK: Clique executado cirurgicamente pelo Javascript da página.');
+    } else {
+        console.log('[LOGIN] Botão não achado via JS. Tentativa alternativa...');
+        await page.getByText('Seu certificado digital').first().click({ force: true });
+    }
 
     console.log('[LOGIN] Passo 6: Aguardando redirecionamento com código mTLS (até 150s)...');
     await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 150000 });
@@ -268,6 +294,7 @@ async function loginGovBr(pfxBase64, password) {
     throw error;
   }
 }
+
 
 // ======================================================
 // ROTA 1: Extrato FGTS Digital (Guias e Valores)
