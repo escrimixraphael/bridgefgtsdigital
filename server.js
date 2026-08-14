@@ -173,11 +173,11 @@ async function loginGovBr(pfxBase64, password) {
       headless: true,
       args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--disable-gpu'], 
       ignoreHTTPSErrors: true,
-      clientCertificates: [{
-        origin: 'https://sso.acesso.gov.br', // <-- CORREÇÃO AQUI: Sem asterisco, URL exata!
-        pfxPath: certPath,
-        passphrase: mtls.passphrase
-      }]
+      // INJETANDO O CERTIFICADO NAS DUAS ROTAS POSSÍVEIS DO GOV.BR
+      clientCertificates: [
+        { origin: 'https://sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
+        { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
+      ]
     });
     console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
 
@@ -192,8 +192,16 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 4 OK: Página do Governo carregada (WAF superado).');
 
     console.log('[LOGIN] Passo 5: Clicando no botão do Certificado Digital...');
-    // Adicionado o seletor exato por ID do Gov.br para garantir o clique
-    await page.locator('#login-certificate, [data-sso-type="certificate"], button:has-text("Seu certificado digital")').first().click();
+    
+    // GOLPE FINAL: Forçar o clique de forma bruta, ignorando animações, e com espera.
+    const btnCert = page.locator('#login-certificate, [data-sso-type="certificate"], button:has-text("Seu certificado digital")').first();
+    await btnCert.waitFor({ state: 'visible', timeout: 10000 }); // Garante que o botão existe
+    await btnCert.click({ force: true }); // Força o clique pelo DOM
+
+    // LOG DE SEGURANÇA: Se a URL mudar, a gente avisa.
+    page.on('framenavigated', frame => {
+       if (frame === page.mainFrame()) console.log(`[LOGIN-REDIRECIONAMENTO] O navegador foi para: ${frame.url()}`);
+    });
 
     console.log('[LOGIN] Passo 6: Aguardando redirecionamento com código mTLS...');
     await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 150000 });
@@ -235,12 +243,11 @@ async function loginGovBr(pfxBase64, password) {
   } catch (error) {
     console.error('[LOGIN-ERRO]', error);
     
-    // NOVO LOG DE DEBUG: Vai extrair o texto vermelho do governo se der erro!
     if (page) {
       console.log('[DEBUG] A página travou nesta URL:', page.url());
       try {
         const bodyText = await page.evaluate(() => {
-          const errDiv = document.querySelector('.br-message.danger, .feedback-danger, .msg-erro, .error');
+          const errDiv = document.querySelector('.br-message.danger, .feedback-danger, .msg-erro, .error, #modal-erro');
           return errDiv ? `ERRO NA TELA: ${errDiv.innerText}` : document.body.innerText;
         });
         console.log('[DEBUG] Texto visível na tela do governo (resumo):', bodyText.replace(/\n/g, ' ').substring(0, 500));
