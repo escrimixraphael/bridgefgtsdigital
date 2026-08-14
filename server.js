@@ -16,7 +16,8 @@ app.use(express.json({ limit: '50mb' }))
 // ======================================================
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '9c6c38a65f8052500b7d4c2aff0b87fa'
 const FGTS_API_KEY = process.env.FGTS_API_KEY || '5341b41fa01513c5b3e23f6dc35b8e94'
-const PORT = process.env.PORT || 10000
+// O Google Cloud Run injeta a variável PORT automaticamente (geralmente 8080)
+const PORT = process.env.PORT || 10000 
 
 function apiKeyValida(recebida) {
   if (!recebida) return false
@@ -93,6 +94,7 @@ async function makePfxTls(pfxBase64, password) {
   const pfxBuffer = Buffer.from(pfxBase64, 'base64');
   console.log('[LOGIN] Iniciando modernização blindada do certificado...');
   
+  // No Cloud Run, o os.tmpdir() aponta para um disco em memória ultra-rápido
   const tmpDir = os.tmpdir();
   const tmpId = crypto.randomUUID();
   const inPath = path.join(tmpDir, `in_${tmpId}.pfx`);
@@ -101,17 +103,14 @@ async function makePfxTls(pfxBase64, password) {
   const passPath = path.join(tmpDir, `pass_${tmpId}.txt`);
   
   try {
-    // Escreve os arquivos (inclusive a senha, para não dar erro com caracteres especiais)
     await fs.writeFile(inPath, pfxBuffer);
     await fs.writeFile(passPath, password);
     
     console.log('[LOGIN] Extraindo chaves do PFX antigo...');
     try {
-      // Tenta com a flag -legacy (para OpenSSL 3+)
       execSync(`openssl pkcs12 -in "${inPath}" -out "${pemPath}" -nodes -legacy -passin file:"${passPath}"`, { stdio: 'pipe' });
     } catch (e1) {
       console.log('[LOGIN] Tentativa com -legacy falhou, tentando padrão...');
-      // Tenta sem a flag -legacy (para OpenSSL mais antigo)
       execSync(`openssl pkcs12 -in "${inPath}" -out "${pemPath}" -nodes -passin file:"${passPath}"`, { stdio: 'pipe' });
     }
     
@@ -120,7 +119,6 @@ async function makePfxTls(pfxBase64, password) {
     
     const modernBuffer = await fs.readFile(outPath);
     
-    // Limpeza pesada
     await Promise.all([
       fs.unlink(inPath).catch(()=>{}),
       fs.unlink(pemPath).catch(()=>{}),
@@ -135,7 +133,6 @@ async function makePfxTls(pfxBase64, password) {
     const linuxError = err.stderr ? err.stderr.toString() : err.message;
     console.error('[LOGIN-ERRO] Falha crítica no OpenSSL Linux:', linuxError);
     
-    // Limpeza em caso de erro
     await Promise.all([
       fs.unlink(inPath).catch(()=>{}),
       fs.unlink(pemPath).catch(()=>{}),
@@ -177,7 +174,7 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-blink-features=AutomationControlled', 
         '--disable-dev-shm-usage', 
         '--disable-gpu',
-        '--no-proxy-server' // FLAG MÁGICA: Corta qualquer túnel/SOCKS fantasma na nuvem e força saída direta
+        '--no-proxy-server'
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
@@ -185,7 +182,7 @@ async function loginGovBr(pfxBase64, password) {
         { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
       ]
     });
-    console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso (Modo Direto Ativado)!');
+    console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
 
     page = browser.pages()[0] || await browser.newPage();
 
@@ -208,12 +205,12 @@ async function loginGovBr(pfxBase64, password) {
 
     if (authId && clientId) {
         const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
-        console.log(`[LOGIN] Passo 5 OK: Saltando direto para o motor de certificados (SEM PROXY)...`);
+        console.log(`[LOGIN] Passo 5 OK: Saltando direto para o motor de certificados (Nativo Cloud Run)...`);
         
         await page.setExtraHTTPHeaders({ 'Referer': 'https://sso.acesso.gov.br/' });
 
-        // Conexão direta e limpa!
-        await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // No Cloud Run essa conexão vai voar porque a rede é direta e limpa!
+        await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
         console.log(`[LOGIN] Conexão mTLS direta estabelecida com sucesso!`);
 
     } else {
@@ -371,4 +368,6 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }))
-app.listen(PORT, () => console.log(`🚀 Bridge FGTS Digital RPA rodando na porta ${PORT}`))
+
+// AJUSTE CRÍTICO AQUI PARA O GOOGLE CLOUD RUN: Escutar em '0.0.0.0'
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Bridge FGTS Digital RPA rodando na porta ${PORT} (0.0.0.0)`))
