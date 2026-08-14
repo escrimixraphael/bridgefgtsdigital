@@ -91,38 +91,59 @@ async function httpRequest(url, options) {
 // ======================================================
 async function makePfxTls(pfxBase64, password) {
   const pfxBuffer = Buffer.from(pfxBase64, 'base64');
-  
-  console.log('[LOGIN] Forçando modernização da criptografia do certificado para o padrão AES-256...');
+  console.log('[LOGIN] Iniciando modernização blindada do certificado...');
   
   const tmpDir = os.tmpdir();
   const tmpId = crypto.randomUUID();
   const inPath = path.join(tmpDir, `in_${tmpId}.pfx`);
+  const pemPath = path.join(tmpDir, `temp_${tmpId}.pem`);
   const outPath = path.join(tmpDir, `out_${tmpId}.pfx`);
-  
-  await fs.writeFile(inPath, pfxBuffer);
+  const passPath = path.join(tmpDir, `pass_${tmpId}.txt`);
   
   try {
-    // Comando mágico: Lê permitindo certificados velhos (-legacy) e exporta FORÇANDO o padrão AES-256 exigido pelo Playwright
-    const cmd = `openssl pkcs12 -in "${inPath}" -nodes -legacy -passin env:PFX_PASS | openssl pkcs12 -export -out "${outPath}" -passout env:PFX_PASS -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg SHA256`;
+    // Escreve os arquivos (inclusive a senha, para não dar erro com caracteres especiais)
+    await fs.writeFile(inPath, pfxBuffer);
+    await fs.writeFile(passPath, password);
     
-    execSync(cmd, { stdio: 'ignore', env: { ...process.env, PFX_PASS: password } }); 
+    console.log('[LOGIN] Extraindo chaves do PFX antigo...');
+    try {
+      // Tenta com a flag -legacy (para OpenSSL 3+)
+      execSync(`openssl pkcs12 -in "${inPath}" -out "${pemPath}" -nodes -legacy -passin file:"${passPath}"`, { stdio: 'pipe' });
+    } catch (e1) {
+      console.log('[LOGIN] Tentativa com -legacy falhou, tentando padrão...');
+      // Tenta sem a flag -legacy (para OpenSSL mais antigo)
+      execSync(`openssl pkcs12 -in "${inPath}" -out "${pemPath}" -nodes -passin file:"${passPath}"`, { stdio: 'pipe' });
+    }
+    
+    console.log('[LOGIN] Recriando PFX com criptografia AES-256 (Padrão Playwright)...');
+    execSync(`openssl pkcs12 -export -in "${pemPath}" -out "${outPath}" -passout file:"${passPath}" -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg SHA256`, { stdio: 'pipe' });
     
     const modernBuffer = await fs.readFile(outPath);
     
-    // Limpa os arquivos temporários
-    await fs.unlink(inPath).catch(() => {});
-    await fs.unlink(outPath).catch(() => {});
+    // Limpeza pesada
+    await Promise.all([
+      fs.unlink(inPath).catch(()=>{}),
+      fs.unlink(pemPath).catch(()=>{}),
+      fs.unlink(outPath).catch(()=>{}),
+      fs.unlink(passPath).catch(()=>{})
+    ]);
     
-    console.log('[LOGIN] Certificado convertido com sucesso para AES-256!');
+    console.log('[LOGIN] SUCESSO! Certificado modernizado para AES-256!');
     return { pfx: modernBuffer, passphrase: password };
     
-  } catch (sslErr) {
-    // Se o OpenSSL falhar, é porque o certificado não precisa do modo "-legacy". Usamos o original.
-    console.log('[LOGIN-AVISO] Certificado já é moderno ou não requer conversão. Usando o original.');
-    await fs.unlink(inPath).catch(() => {});
-    await fs.unlink(outPath).catch(() => {});
+  } catch (err) {
+    const linuxError = err.stderr ? err.stderr.toString() : err.message;
+    console.error('[LOGIN-ERRO] Falha crítica no OpenSSL Linux:', linuxError);
     
-    return { pfx: pfxBuffer, passphrase: password };
+    // Limpeza em caso de erro
+    await Promise.all([
+      fs.unlink(inPath).catch(()=>{}),
+      fs.unlink(pemPath).catch(()=>{}),
+      fs.unlink(outPath).catch(()=>{}),
+      fs.unlink(passPath).catch(()=>{})
+    ]);
+    
+    throw new Error(`Falha ao modernizar certificado. Detalhes: ${linuxError}`);
   }
 }
 
