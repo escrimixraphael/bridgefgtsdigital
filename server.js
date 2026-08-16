@@ -174,7 +174,7 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 2 OK: Arquivo salvo no servidor.');
 
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
-        browser = await chromium.launchPersistentContext('', {
+    browser = await chromium.launchPersistentContext('', {
       headless: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       args: [
@@ -200,38 +200,42 @@ async function loginGovBr(pfxBase64, password) {
     const state = crypto.randomUUID();
     const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`;
 
-    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     
-    console.log('[LOGIN] Aguardando redirecionamento interno do Serpro gerar a sessão...');
-    await page.waitForURL(/authorization_id=/, { timeout: 30000 });
-    console.log('[LOGIN] Passo 4 OK: Página do Governo carregada e sessão confirmada.');
+    console.log('[LOGIN] Analisando a tela para encontrar a porta de entrada mTLS...');
+    
+    // Tenta esperar o redirecionamento automático
+    try {
+      await page.waitForURL(/authorization_id=/, { timeout: 15000 });
+    } catch(e) {
+      console.log('[LOGIN] Redirecionamento atrasado. Tentando forçar o clique...');
+    }
 
-    console.log('[LOGIN] Passo 5: Evadindo o hCaptcha através de Salto Direto (Bypass)...');
-    
     const currentUrl = new URL(page.url());
-    const authId = currentUrl.searchParams.get('authorization_id');
-    const clientId = currentUrl.searchParams.get('client_id');
+    let authId = currentUrl.searchParams.get('authorization_id');
+    let clientId = currentUrl.searchParams.get('client_id');
 
     if (authId && clientId) {
         const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
-        console.log(`[LOGIN] Passo 5 OK: Saltando direto para o motor de certificados (Nativo Cloud Run)...`);
+        console.log(`[LOGIN] Passo 5: Saltando direto para o motor de certificados (Bypass WAF)...`);
         
         await page.setExtraHTTPHeaders({ 'Referer': 'https://sso.acesso.gov.br/' });
-
-        // No Cloud Run essa conexão vai voar porque a rede é direta e limpa!
         await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        console.log(`[LOGIN] Conexão mTLS direta estabelecida com sucesso!`);
-
     } else {
-        console.log('[LOGIN] ERRO: authorization_id não encontrado na URL após a espera. Tentando clique...');
-        await page.getByText('Seu certificado digital').first().click({ force: true });
+        console.log('[LOGIN] Passo 5: auth_id não apareceu. Forçando clique no botão do certificado...');
+        try {
+          await page.waitForSelector('text="Seu certificado digital"', { timeout: 10000 });
+          await page.getByText('Seu certificado digital').first().click({ force: true });
+        } catch (e) {
+          console.log('[LOGIN] Botão de certificado não encontrado, a tela deve estar em transição.');
+        }
     }
 
-    console.log('[LOGIN] Passo 6: Aguardando redirecionamento com código mTLS (até 150s)...');
-    await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 150000 });
+    console.log('[LOGIN] Passo 6: Aguardando Servidor Serpro aprovar o mTLS (até 90s)...');
+    await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 90000 });
     
     const urlFgtsCode = page.url();
-    console.log('[LOGIN] Passo 6 OK: SUCESSO! Código capturado:', urlFgtsCode.substring(0, 70) + '...');
+    console.log('[LOGIN] Passo 6 OK: SUCESSO EXTREMO! Código Serpro capturado!');
 
     const playwrightCookies = await browser.cookies();
     const jar = newCookieJar();
