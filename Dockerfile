@@ -4,26 +4,27 @@ FROM node:20-bookworm-slim
 # 2. Define a pasta onde tudo vai acontecer
 WORKDIR /app
 
-# 3. Instala o OpenSSL atualizado e bibliotecas base
-RUN apt-get update && apt-get install -y openssl libgconf-2-4 libnss3 libnspr4 libxss1 libasound2 libatk-bridge2.0-0 libgtk-3-0 && rm -rf /var/lib/apt/lists/*
+# 3. Instala apenas o OpenSSL primeiro
+RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 
-# 4. Copia os arquivos de dependência
+# 4. A MÁGICA DEFINITIVA ACONTECE AQUI:
+# O valor "0" obriga o Playwright a guardar o Chromium DENTRO da pasta do projeto
+# Isso tem que ficar ANTES do 'npm install'.
+ENV PLAYWRIGHT_BROWSERS_PATH=0
+
+# 5. Copia os arquivos de dependência
 COPY package*.json ./
 
-# 5. Instala o Node.js
+# 6. Agora sim! O npm vai ler a variável acima e instalar o Chromium no lugar exato.
 RUN npm install
 
-# 6. O SEGREDO MÁGICO PARA O CLOUD RUN:
-# Obriga o Playwright a instalar os navegadores dentro da nossa pasta /app
-ENV PLAYWRIGHT_BROWSERS_PATH=/app/pw-browsers
-
-# 7. Baixa os binários do Chromium (agora eles vão ficar em /app/pw-browsers)
+# 7. Instala as bibliotecas gráficas do Linux necessárias para o Chromium rodar
 RUN npx playwright install --with-deps chromium
 
 # 8. Copia o resto do seu código
 COPY . .
 
-# 9. Libera a porta (O Cloud Run usa a variavel $PORT, mas 10000 é nosso backup)
+# 9. Libera a porta
 EXPOSE 10000
 
 # 10. Inicia a Bridge
