@@ -1,26 +1,30 @@
-# Usa a imagem padrão e leve do Node.js (Foge do bug da Microsoft no GCP)
+# 1. Usa o Linux super leve com Node.js já instalado
 FROM node:20-bookworm-slim
 
-# Define a pasta de trabalho dentro do servidor
+# 2. Define a pasta onde tudo vai acontecer
 WORKDIR /app
 
-# Instala o OpenSSL nativo do Linux (Vital para o seu conversor de Certificados PFX)
-RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
+# 3. Instala o OpenSSL atualizado e bibliotecas base
+RUN apt-get update && apt-get install -y openssl libgconf-2-4 libnss3 libnspr4 libxss1 libasound2 libatk-bridge2.0-0 libgtk-3-0 && rm -rf /var/lib/apt/lists/*
 
-# Copia as informações dos pacotes
+# 4. Copia os arquivos de dependência
 COPY package*.json ./
 
-# Instala as dependências do Node (express, playwright, etc)
+# 5. Instala o Node.js
 RUN npm install
 
-# MÁGICA: Pede para o Playwright baixar APENAS o Chromium e instalar as dependências gráficas do Linux
+# 6. O SEGREDO MÁGICO PARA O CLOUD RUN:
+# Obriga o Playwright a instalar os navegadores dentro da nossa pasta /app
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/pw-browsers
+
+# 7. Baixa os binários do Chromium (agora eles vão ficar em /app/pw-browsers)
 RUN npx playwright install --with-deps chromium
 
-# Copia o resto do seu código (server.js, etc)
+# 8. Copia o resto do seu código
 COPY . .
 
-# Expõe a porta para o Google Cloud
+# 9. Libera a porta (O Cloud Run usa a variavel $PORT, mas 10000 é nosso backup)
 EXPOSE 10000
 
-# Comando para iniciar o servidor
+# 10. Inicia a Bridge
 CMD ["node", "server.js"]
