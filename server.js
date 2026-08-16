@@ -30,8 +30,16 @@ function apiKeyValida(recebida) {
 }
 
 function requireApiKey(req, res, next) {
-  const recebida = req.headers['x-api-key'] || req.headers['fgts-api-key']
-  if (!apiKeyValida(recebida)) return res.status(403).json({ success: false, error: 'Acesso negado: Chave API inválida.' })
+  // Aceita chaves nos headers 'x-api-key', 'fgts-api-key' ou no padrão 'Authorization: Bearer <CHAVE>'
+  let recebida = req.headers['x-api-key'] || req.headers['fgts-api-key'] || req.headers['authorization'];
+  
+  if (recebida && recebida.startsWith('Bearer ')) {
+    recebida = recebida.replace('Bearer ', '');
+  }
+
+  if (!apiKeyValida(recebida)) {
+    return res.status(403).json({ success: false, error: 'Acesso negado: Chave API inválida.' });
+  }
   next()
 }
 
