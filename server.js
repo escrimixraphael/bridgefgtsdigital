@@ -174,7 +174,7 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 2 OK: Arquivo salvo no servidor.');
 
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
-    browser = await chromium.launchPersistentContext('', {
+        browser = await chromium.launchPersistentContext('', {
       headless: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       args: [
@@ -182,7 +182,8 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-blink-features=AutomationControlled', 
         '--disable-dev-shm-usage', 
         '--disable-gpu',
-        '--no-proxy-server'
+        '--proxy-server=direct://',
+        '--proxy-bypass-list=*'
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
