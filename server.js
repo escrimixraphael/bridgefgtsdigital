@@ -193,7 +193,8 @@ async function loginGovBr(pfxBase64, password) {
       ignoreHTTPSErrors: true,
       clientCertificates: [
         { origin: 'https://sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
-        { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
+        // Corrigido para certificado.sso (singular e com .sso)
+        { origin: 'https://certificado.sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
       ]
     });
     console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
@@ -220,7 +221,8 @@ async function loginGovBr(pfxBase64, password) {
     let clientId = currentUrl.searchParams.get('client_id');
 
     if (authId && clientId) {
-        const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
+        // CORREÇÃO CRÍTICA AQUI: Alterado de certificados.acesso.gov.br para certificado.sso.acesso.gov.br
+        const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
         console.log(`[LOGIN] Passo 5: Saltando direto para o motor de certificados (Bypass WAF)...`);
         
         await page.setExtraHTTPHeaders({ 'Referer': 'https://sso.acesso.gov.br/' });
