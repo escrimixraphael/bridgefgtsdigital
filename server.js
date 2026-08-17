@@ -182,8 +182,7 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-blink-features=AutomationControlled', 
         '--disable-dev-shm-usage', 
         '--disable-gpu',
-        '--proxy-server=direct://',
-        '--proxy-bypass-list=*'
+        '--dns-prefetch-disable'
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
