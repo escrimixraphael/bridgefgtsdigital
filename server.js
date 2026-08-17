@@ -3,6 +3,10 @@ import cors from 'cors'
 import crypto from 'node:crypto'
 import dns from 'node:dns'
 import https from 'node:https'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { execSync } from 'node:child_process'
 import { chromium } from 'playwright'
 
 // Resolve DNS de IPv6 do Cloud Run
@@ -76,10 +80,54 @@ async function httpRequest(url, options) {
 }
 
 // ======================================================
-// MOTOR mTLS NATIVO DO NODE.JS (BYPASS DO PLAYWRIGHT)
+// EXTRAÇÃO DE PEM VIA OPENSSL (BYPASS NO NODE 18/20 PFX)
 // ======================================================
-async function executeMtlsHandshake(url, pfxBuffer, passphrase, playwrightCookies) {
-  console.log(`[LOGIN] Disparando Handshake mTLS Nativo (Node.js) para: ${url.substring(0, 70)}...`);
+async function convertPfxToPem(pfxBase64, password) {
+  const buf = Buffer.from(pfxBase64, 'base64');
+  const tmpDir = os.tmpdir();
+  const uuid = crypto.randomUUID();
+  const inPath = path.join(tmpDir, `in_${uuid}.pfx`);
+  const certPath = path.join(tmpDir, `cert_${uuid}.pem`);
+  const keyPath = path.join(tmpDir, `key_${uuid}.pem`);
+  const passPath = path.join(tmpDir, `pass_${uuid}.txt`);
+  
+  await fs.writeFile(inPath, buf);
+  await fs.writeFile(passPath, password);
+  
+  try {
+      console.log('[LOGIN] Convertendo PFX legado para PEM via OpenSSL...');
+      try {
+          // Tenta a extração padrão do OpenSSL
+          execSync(`openssl pkcs12 -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`);
+          execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`);
+      } catch (err) {
+          // Fallback para OpenSSL 3+ com a flag -legacy
+          execSync(`openssl pkcs12 -legacy -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`);
+          execSync(`openssl pkcs12 -legacy -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`);
+      }
+      
+      const cert = await fs.readFile(certPath, 'utf8');
+      const key = await fs.readFile(keyPath, 'utf8');
+      
+      return { cert, key };
+  } catch (err) {
+      throw new Error(`Falha ao converter certificado: A senha está incorreta ou o arquivo está corrompido.`);
+  } finally {
+      // Limpeza de arquivos sensíveis
+      await Promise.all([
+          fs.unlink(inPath).catch(()=>{}),
+          fs.unlink(certPath).catch(()=>{}),
+          fs.unlink(keyPath).catch(()=>{}),
+          fs.unlink(passPath).catch(()=>{})
+      ]);
+  }
+}
+
+// ======================================================
+// MOTOR mTLS NATIVO DO NODE.JS (COM CERTIFICADO PURO)
+// ======================================================
+async function executeMtlsHandshake(url, certPem, keyPem, playwrightCookies) {
+  console.log(`[LOGIN] Disparando Handshake mTLS Nativo para: ${url.substring(0, 70)}...`);
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const cookieStr = playwrightCookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -89,10 +137,10 @@ async function executeMtlsHandshake(url, pfxBuffer, passphrase, playwrightCookie
       port: 443,
       path: u.pathname + u.search,
       method: 'GET',
-      pfx: pfxBuffer,
-      passphrase: passphrase,
+      cert: certPem, // Passando o texto puro do Certificado
+      key: keyPem,   // Passando o texto puro da Chave
       rejectUnauthorized: false,
-      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT, // Aceita certificados RC2 antigos
+      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
       headers: {
         'Cookie': cookieStr,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
@@ -129,14 +177,13 @@ async function executeMtlsHandshake(url, pfxBuffer, passphrase, playwrightCookie
 }
 
 // ======================================================
-// ESTRATÉGIA HÍBRIDA (PLAYWRIGHT -> NODE mTLS -> PLAYWRIGHT)
+// ESTRATÉGIA HÍBRIDA
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
   console.log('[LOGIN] Iniciando motor híbrido (WAF Bypass)...');
   
   let browser;
   let page; 
-  const pfxBuffer = Buffer.from(pfxBase64, 'base64');
 
   try {
     browser = await chromium.launchPersistentContext('', {
@@ -150,7 +197,6 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-blink-features=AutomationControlled'
       ], 
       ignoreHTTPSErrors: true
-      // NENHUM clientCertificates! O Playwright roda "limpo".
     });
     
     page = browser.pages()[0] || await browser.newPage();
@@ -165,18 +211,16 @@ async function loginGovBr(pfxBase64, password) {
     const authId = authUrlAtual.searchParams.get('authorization_id');
     const cId = authUrlAtual.searchParams.get('client_id');
 
-    if (!authId || !cId) {
-        throw new Error(`Não capturou authorization_id do SSO. A página travou em: ${page.url()}`);
-    }
+    if (!authId || !cId) throw new Error(`Não capturou authorization_id do SSO. URL: ${page.url()}`);
 
     console.log(`[LOGIN] Passo 2: Sessão capturada! Pausando navegador e assumindo Node.js...`);
     const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${cId}&authorization_id=${authId}`;
     const pwCookies = await browser.cookies();
     
-    // Injeção Direta por TLS via HTTPS NATIVO
-    const mtlsResult = await executeMtlsHandshake(certUrl, pfxBuffer, password, pwCookies);
+    // NOVIDADE AQUI: Usa a função OpenSSL para quebrar o PFX em PEM (livrando o Node 18 do erro)
+    const { cert, key } = await convertPfxToPem(pfxBase64, password);
+    const mtlsResult = await executeMtlsHandshake(certUrl, cert, key, pwCookies);
     
-    // Sincroniza cookies de autorização de volta no Playwright
     if (mtlsResult.setCookies && mtlsResult.setCookies.length > 0) {
         const cookiesToInject = mtlsResult.setCookies.map(cookieStr => {
             const [nameValue] = cookieStr.split(';');
