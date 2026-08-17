@@ -1,33 +1,22 @@
-# 1. Usa o Linux super leve com Node.js já instalado
-FROM node:20-bookworm-slim
+# Usa uma imagem oficial do Node (versão 20) com Debian
+FROM node:20-bullseye
 
-# 2. Define a pasta onde tudo vai acontecer
+# Instala todas as dependências que o Chromium/Chrome precisa para rodar no Linux
+RUN apt-get update \
+    && apt-get install -y wget gnupg \
+    && apt-get install -y libnss3 libnss3-tools libxss1 libasound2 libatk-bridge2.0-0 libgtk-3-0 libgbm-dev \
+    chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configura a pasta de trabalho
 WORKDIR /app
 
-# 3. Instala apenas o OpenSSL primeiro
-RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
-
-# 4. A MÁGICA DEFINITIVA ACONTECE AQUI:
-ENV PLAYWRIGHT_BROWSERS_PATH=0
-# Estas três linhas são OBRIGATÓRIAS para o Playwright conseguir acessar a rede no Cloud Run Gen2
-ENV DBUS_FATAL_WARNINGS=0
-ENV DISABLE_WAYLAND=1
-ENV NO_UPDATE_NOTIFIER=true
-
-# 5. Copia os arquivos de dependência
+# Copia os arquivos de dependência e instala
 COPY package*.json ./
-
-# 6. Agora sim! O npm vai ler a variável acima e instalar o Chromium no lugar exato.
 RUN npm install
 
-# 7. Instala as bibliotecas gráficas do Linux necessárias para o Chromium rodar
-RUN npx playwright install --with-deps chromium
-
-# 8. Copia o resto do seu código
+# Copia o resto do código
 COPY . .
 
-# 9. Libera a porta
-EXPOSE 10000
-
-# 10. Inicia a Bridge
+# Comando para iniciar o seu server.js
 CMD ["node", "server.js"]
