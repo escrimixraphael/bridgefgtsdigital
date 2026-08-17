@@ -5,7 +5,13 @@ import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 import { execSync } from 'node:child_process'
+import dns from 'node:dns'
 import { chromium } from 'playwright'
+
+// ======================================================
+// CONFIGURAÇÃO GLOBAL (Resolve DNS do Cloud Run Gen 2)
+// ======================================================
+dns.setDefaultResultOrder('ipv4first'); // Garante que o Node e o Proxy do Playwright achem o IP correto sem timeout de IPv6
 
 const app = express()
 app.use(cors())
@@ -160,16 +166,11 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage', 
         '--disable-gpu',
-        '--disable-blink-features=AutomationControlled',
-        '--no-proxy-server',
-        '--proxy-bypass-list=*',
-        '--disable-features=AsyncDns', 
-        '--disable-async-dns',
-        '--dns-prefetch-disable'
+        '--disable-blink-features=AutomationControlled'
+        // IMPORTANTE: Removidas as flags de bypass de proxy para permitir que o Playwright injete o Certificado!
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
-        // Mapeamos todas as variações de domínio mTLS que o Serpro usa para não haver fuga
         { origin: 'https://sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
         { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
         { origin: 'https://certificado.sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
@@ -189,7 +190,6 @@ async function loginGovBr(pfxBase64, password) {
     
     try {
       await page.waitForURL(/authorization_id=/, { timeout: 15000 });
-      // Espera garantir que scripts da tela inicial de login estejam atados
       await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
     } catch(e) {
       console.log('[LOGIN] Aviso: A tela demorou para estabilizar, prosseguindo...');
@@ -200,7 +200,6 @@ async function loginGovBr(pfxBase64, password) {
     let clickSuccess = false;
     const currentUrl = page.url();
 
-    // TENTATIVA 1: Clique Nativo Direto no ID do botão
     try {
       await page.locator('#login-certificate').click({ force: true, timeout: 5000 });
       await page.waitForURL(url => url.href !== currentUrl, { timeout: 8000 });
@@ -208,8 +207,6 @@ async function loginGovBr(pfxBase64, password) {
       clickSuccess = true;
     } catch (e) {
       console.log('[LOGIN] Clique nativo falhou ou não redirecionou. Tentando via JS Eval...');
-      
-      // TENTATIVA 2: Executa um click em Javascript no frontend para burlar bloqueios visuais
       try {
         await page.evaluate(() => {
           const btn = document.getElementById('login-certificate');
@@ -223,7 +220,6 @@ async function loginGovBr(pfxBase64, password) {
       }
     }
 
-    // TENTATIVA 3: Se o botão definitivamente não funcionou, montamos e pulamos pra URL manualmente
     if (!clickSuccess) {
       const u = new URL(page.url());
       const authId = u.searchParams.get('authorization_id');
@@ -239,7 +235,6 @@ async function loginGovBr(pfxBase64, password) {
 
     console.log('[LOGIN] Passo 6: Aguardando validação mTLS do Serpro (Fast-Fail de 90s)...');
     
-    // Rastreador que avalia tanto o sucesso (FGTS) quanto erro de certificado rejeitado
     await page.waitForURL(url => {
         const href = url.href;
         return href.includes('fgtsdigital.sistema.gov.br/portal/acessogov?code=') || href.includes('acesso.gov.br/info/x509/');
