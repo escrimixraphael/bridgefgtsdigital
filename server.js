@@ -163,13 +163,13 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-blink-features=AutomationControlled',
         '--no-proxy-server',
         '--proxy-bypass-list=*',
-        '--disable-features=AsyncDns', // Impede erro de DNS no Cloud Run Gen 2
+        '--disable-features=AsyncDns', 
         '--disable-async-dns',
         '--dns-prefetch-disable'
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
-        // Mapeamos todos os endpoints possíveis para não haver chance de falha no vínculo mTLS
+        // Mapeamos todas as variações de domínio mTLS que o Serpro usa para não haver fuga
         { origin: 'https://sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
         { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
         { origin: 'https://certificado.sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
@@ -189,42 +189,67 @@ async function loginGovBr(pfxBase64, password) {
     
     try {
       await page.waitForURL(/authorization_id=/, { timeout: 15000 });
+      // Espera garantir que scripts da tela inicial de login estejam atados
+      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
     } catch(e) {
-      console.log('[LOGIN] Redirecionamento atrasado. Aguardando processamento da tela...');
+      console.log('[LOGIN] Aviso: A tela demorou para estabilizar, prosseguindo...');
     }
 
-    console.log('[LOGIN] Passo 5: Acionando login por certificado (Bypass WAF)...');
+    console.log('[LOGIN] Passo 5: Acionando login por certificado (Estratégia Tripla)...');
     
-    // Tenta primeiro clicar no botão oficial para manter os cookies de sessão que o Gov.br gera no meio do caminho
     let clickSuccess = false;
+    const currentUrl = page.url();
+
+    // TENTATIVA 1: Clique Nativo Direto no ID do botão
     try {
-        await page.waitForSelector('text="Seu certificado digital"', { timeout: 5000 });
-        await page.locator('text="Seu certificado digital"').first().click({ force: true });
-        console.log('[LOGIN] Botão de certificado clicado com sucesso!');
-        clickSuccess = true;
+      await page.locator('#login-certificate').click({ force: true, timeout: 5000 });
+      await page.waitForURL(url => url.href !== currentUrl, { timeout: 8000 });
+      console.log('[LOGIN] Sucesso no clique nativo! URL alterada.');
+      clickSuccess = true;
     } catch (e) {
-        console.log('[LOGIN] Botão não encontrado ou WAF bloqueou a interface. Tentando saltar...');
+      console.log('[LOGIN] Clique nativo falhou ou não redirecionou. Tentando via JS Eval...');
+      
+      // TENTATIVA 2: Executa um click em Javascript no frontend para burlar bloqueios visuais
+      try {
+        await page.evaluate(() => {
+          const btn = document.getElementById('login-certificate');
+          if (btn) btn.click();
+        });
+        await page.waitForURL(url => url.href !== currentUrl, { timeout: 8000 });
+        console.log('[LOGIN] Sucesso no clique via JS! URL alterada.');
+        clickSuccess = true;
+      } catch (err) {
+        console.log('[LOGIN] Clique JS também falhou em navegar. Forçando URL direta (Fallback Final)...');
+      }
     }
 
-    // Se o clique falhar, faz o salto forçado direto pela URL
+    // TENTATIVA 3: Se o botão definitivamente não funcionou, montamos e pulamos pra URL manualmente
     if (!clickSuccess) {
-        const currentUrl = new URL(page.url());
-        let authId = currentUrl.searchParams.get('authorization_id');
-        let clientId = currentUrl.searchParams.get('client_id');
-        
-        if (authId && clientId) {
-            // Voltamos ao domínio plural que é o correto mTLS, o erro de DNS resolvido pelas flags do passo 3 
-            const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
-            console.log(`[LOGIN] Saltando direto pela URL de certificado...`);
-            await page.setExtraHTTPHeaders({ 'Referer': 'https://sso.acesso.gov.br/' });
-            await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        } else {
-            console.log('[LOGIN] ERRO: auth_id não encontrado, a navegação pode falhar.');
-        }
+      const u = new URL(page.url());
+      const authId = u.searchParams.get('authorization_id');
+      const clientId = u.searchParams.get('client_id');
+      if (authId && clientId) {
+        const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
+        console.log(`[LOGIN] Fallback Ativado: Indo direto para ${certUrl}`);
+        await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } else {
+        console.log('[LOGIN] ERRO CRÍTICO: Parâmetros auth_id / client_id ausentes da URL.');
+      }
     }
 
-    console.log('[LOGIN] Passo 6: Aguardando Servidor Serpro aprovar o mTLS (até 90s)...');
-    await page.waitForURL('**/fgtsdigital.sistema.gov.br/portal/acessogov?code=**', { timeout: 90000 });
+    console.log('[LOGIN] Passo 6: Aguardando validação mTLS do Serpro (Fast-Fail de 90s)...');
+    
+    // Rastreador que avalia tanto o sucesso (FGTS) quanto erro de certificado rejeitado
+    await page.waitForURL(url => {
+        const href = url.href;
+        return href.includes('fgtsdigital.sistema.gov.br/portal/acessogov?code=') || href.includes('acesso.gov.br/info/x509/');
+    }, { timeout: 90000 });
+
+    if (page.url().includes('acesso.gov.br/info/x509/')) {
+        const e = new Error(`O Governo rejeitou o certificado digital. Verifique a validade ou a senha. URL travada: ${page.url()}`);
+        e.pfxStage = 'PFX_INVALID';
+        throw e;
+    }
     
     const urlFgtsCode = page.url();
     console.log('[LOGIN] Passo 6 OK: SUCESSO EXTREMO! Código Serpro capturado!');
@@ -261,7 +286,7 @@ async function loginGovBr(pfxBase64, password) {
     return { jar, finalUrl: urlFgtsCode, headersApiFgts };
 
   } catch (error) {
-    console.error('[LOGIN-ERRO]', error);
+    console.error('[LOGIN-ERRO]', error.message);
     if (page) {
       console.log('[DEBUG] A página travou nesta URL:', page.url());
       try {
@@ -269,7 +294,7 @@ async function loginGovBr(pfxBase64, password) {
           const errDiv = document.querySelector('.br-message.danger, .feedback-danger, .msg-erro, .error, #modal-erro');
           return errDiv ? `ERRO NA TELA: ${errDiv.innerText}` : document.body.innerText;
         });
-        console.log('[DEBUG] Texto visível na tela do governo (resumo):', bodyText.replace(/\n/g, ' ').substring(0, 500));
+        console.log('[DEBUG] Texto visível na tela (resumo):', bodyText.replace(/\n/g, ' ').substring(0, 500));
       } catch (e) {}
     }
     if (browser) await browser.close().catch(() => {});
