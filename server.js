@@ -1,11 +1,8 @@
 import express from 'express'
 import cors from 'cors'
 import crypto from 'node:crypto'
-import os from 'node:os'
-import path from 'node:path'
-import fs from 'node:fs/promises'
-import { execSync } from 'node:child_process'
 import dns from 'node:dns'
+import https from 'node:https'
 import { chromium } from 'playwright'
 
 // Resolve DNS de IPv6 do Cloud Run
@@ -32,20 +29,18 @@ function apiKeyValida(recebida) {
 function requireApiKey(req, res, next) {
   let recebida = req.headers['x-api-key'] || req.headers['fgts-api-key'] || req.headers['authorization'];
   if (recebida && recebida.startsWith('Bearer ')) recebida = recebida.replace('Bearer ', '');
-  if (!apiKeyValida(recebida)) return res.status(403).json({ success: false, error: 'Acesso negado: Chave API inválida.' });
+  if (!apiKeyValida(recebida)) return res.status(403).json({ success: false, error: 'Acesso negado.' });
   next()
 }
 
 function classifyError(err, stage) {
   const code = err?.code || ''
   const msg = err?.message || String(err)
-  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão.' }
+  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão com o Governo.' }
   return { errorType: 'BRIDGE_INTERNAL', stage, code: code || 'UNKNOWN', message: msg }
 }
 
-function tryParseJson(str) {
-  try { return JSON.parse(str); } catch (e) { return str; }
-}
+function tryParseJson(str) { try { return JSON.parse(str); } catch { return str; } }
 
 function newCookieJar() {
   return {
@@ -74,79 +69,76 @@ async function httpRequest(url, options) {
   const fetchOpts = { method: options.method || 'GET', headers: { ...options.headers } };
   if (options.jar) fetchOpts.headers['Cookie'] = options.jar.getCookieString();
   if (options.body) fetchOpts.body = options.body;
-
   const response = await fetch(url, fetchOpts);
   if (options.jar) options.jar.extractFromResponse(response.headers);
   const text = await response.text();
-  
   return { status: response.status, headers: response.headers, body: text };
 }
 
 // ======================================================
-// NOVO ALGORITMO: EXTRAÇÃO PARA PEM (CERTIFICADO E CHAVE)
+// MOTOR mTLS NATIVO DO NODE.JS (BYPASS DO PLAYWRIGHT)
 // ======================================================
-async function makePemTls(pfxBase64, password) {
-  const pfxBuffer = Buffer.from(pfxBase64, 'base64');
-  console.log('[LOGIN] Extraindo certificado e chave privada para o formato PEM puro...');
-  
-  const tmpDir = os.tmpdir();
-  const tmpId = crypto.randomUUID();
-  const inPath = path.join(tmpDir, `in_${tmpId}.pfx`);
-  const certPath = path.join(tmpDir, `cert_${tmpId}.pem`);
-  const keyPath = path.join(tmpDir, `key_${tmpId}.pem`);
-  const passPath = path.join(tmpDir, `pass_${tmpId}.txt`);
-  
-  try {
-    await fs.writeFile(inPath, pfxBuffer);
-    await fs.writeFile(passPath, password);
+async function executeMtlsHandshake(url, pfxBuffer, passphrase, playwrightCookies) {
+  console.log(`[LOGIN] Disparando Handshake mTLS Nativo (Node.js) para: ${url.substring(0, 70)}...`);
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const cookieStr = playwrightCookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+    const options = {
+      hostname: u.hostname,
+      port: 443,
+      path: u.pathname + u.search,
+      method: 'GET',
+      pfx: pfxBuffer,
+      passphrase: passphrase,
+      rejectUnauthorized: false,
+      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT, // Aceita certificados RC2 antigos
+      headers: {
+        'Cookie': cookieStr,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Referer': 'https://sso.acesso.gov.br/'
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        console.log(`[LOGIN] Resposta mTLS Nativa - Status: ${res.statusCode}`);
+        const location = res.headers.location;
+        const setCookies = res.headers['set-cookie'] || [];
+        
+        if (res.statusCode >= 300 && res.statusCode < 400 && location) {
+           resolve({ success: true, location, setCookies });
+        } else {
+           if (body.includes('acesso.gov.br/info/x509') || body.includes('Revogado')) {
+               const e = new Error('Certificado Rejeitado/Revogado pelo Gov.br.');
+               e.pfxStage = 'PFX_INVALID';
+               reject(e);
+           } else {
+               reject(new Error(`Falha no mTLS nativo. Status: ${res.statusCode}.`));
+           }
+        }
+      });
+    });
     
-    // O parâmetro -nodes remove a criptografia da chave, garantindo que o NodeJS leia 100% liso
-    try {
-      execSync(`openssl pkcs12 -in "${inPath}" -clcerts -nokeys -out "${certPath}" -legacy -passin file:"${passPath}"`, { stdio: 'pipe' });
-      execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -legacy -passin file:"${passPath}"`, { stdio: 'pipe' });
-    } catch (e1) {
-      console.log('[LOGIN] Fallback: Tentando extração via padrão OpenSSL 3...');
-      execSync(`openssl pkcs12 -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
-      execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
-    }
-    
-    console.log('[LOGIN] Sucesso absoluto! PEM extraído e pronto para injeção mTLS.');
-    return { inPath, certPath, keyPath, passPath };
-    
-  } catch (err) {
-    const linuxError = err.stderr ? err.stderr.toString() : err.message;
-    console.error('[LOGIN-ERRO] Falha crítica na extração PEM:', linuxError);
-    await Promise.all([fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}), fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{})]);
-    throw new Error(`Falha ao ler certificado digital. Verifique a senha ou validade.`);
-  }
+    req.on('error', (err) => reject(new Error(`Falha de rede no mTLS: ${err.message}`)));
+    req.end();
+  });
 }
 
 // ======================================================
-// MOTOR DE LOGIN COM WAF BYPASS E HTTP/2 DISABLED
+// ESTRATÉGIA HÍBRIDA (PLAYWRIGHT -> NODE mTLS -> PLAYWRIGHT)
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
-  console.log('[LOGIN] Iniciando motor blindado (Playwright) para bypass do WAF...');
-
+  console.log('[LOGIN] Iniciando motor híbrido (WAF Bypass)...');
+  
   let browser;
   let page; 
-  let mtls = null;
-
-  const cleanupMtls = async () => {
-    if (mtls) {
-      await Promise.all([
-        fs.unlink(mtls.inPath).catch(()=>{}),
-        fs.unlink(mtls.certPath).catch(()=>{}),
-        fs.unlink(mtls.keyPath).catch(()=>{}),
-        fs.unlink(mtls.passPath).catch(()=>{})
-      ]);
-    }
-  };
+  const pfxBuffer = Buffer.from(pfxBase64, 'base64');
 
   try {
-    mtls = await makePemTls(pfxBase64, password);
-
-    console.log('[LOGIN] Solicitando abertura do motor Chromium no Linux...');
-    
     browser = await chromium.launchPersistentContext('', {
       headless: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -155,72 +147,53 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage', 
         '--disable-gpu',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-http2' // A CORREÇÃO DE OURO: Mata o bug de ALPN (HTTP/2) do Playwright Proxy
+        '--disable-blink-features=AutomationControlled'
       ], 
-      ignoreHTTPSErrors: true,
-      clientCertificates: [
-        { origin: 'https://sso.acesso.gov.br', certPath: mtls.certPath, keyPath: mtls.keyPath },
-        { origin: 'https://certificados.acesso.gov.br', certPath: mtls.certPath, keyPath: mtls.keyPath },
-        { origin: 'https://certificado.sso.acesso.gov.br', certPath: mtls.certPath, keyPath: mtls.keyPath },
-        { origin: 'https://acesso.gov.br', certPath: mtls.certPath, keyPath: mtls.keyPath }
-      ]
+      ignoreHTTPSErrors: true
+      // NENHUM clientCertificates! O Playwright roda "limpo".
     });
     
-    console.log('[LOGIN] Motor preparado e HTTP/2 desativado.');
     page = browser.pages()[0] || await browser.newPage();
 
-    console.log('[LOGIN] Acessando URL de autorização do Gov.br...');
-    const nonce = crypto.randomUUID();
-    const state = crypto.randomUUID();
-    const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`;
+    console.log('[LOGIN] Passo 1: Acessando Autorização Gov.br para gerar sessão...');
+    const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${crypto.randomUUID()}&state=${crypto.randomUUID()}`;
 
     await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForURL(/authorization_id=/, { timeout: 15000 }).catch(() => {});
     
-    try {
-      await page.waitForURL(/authorization_id=/, { timeout: 15000 });
-      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
-    } catch(e) { }
+    const authUrlAtual = new URL(page.url());
+    const authId = authUrlAtual.searchParams.get('authorization_id');
+    const cId = authUrlAtual.searchParams.get('client_id');
 
-    console.log('[LOGIN] Acionando login por certificado (Estratégia Tripla)...');
+    if (!authId || !cId) {
+        throw new Error(`Não capturou authorization_id do SSO. A página travou em: ${page.url()}`);
+    }
+
+    console.log(`[LOGIN] Passo 2: Sessão capturada! Pausando navegador e assumindo Node.js...`);
+    const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${cId}&authorization_id=${authId}`;
+    const pwCookies = await browser.cookies();
     
-    let clickSuccess = false;
-    const currentUrl = page.url();
-
-    try {
-      await page.locator('#login-certificate').click({ force: true, timeout: 5000 });
-      await page.waitForURL(url => url.href !== currentUrl, { timeout: 8000 });
-      console.log('[LOGIN] Sucesso no clique nativo! URL alterada.');
-      clickSuccess = true;
-    } catch (e) {
-      try {
-        await page.evaluate(() => {
-          const btn = document.getElementById('login-certificate');
-          if (btn) btn.click();
+    // Injeção Direta por TLS via HTTPS NATIVO
+    const mtlsResult = await executeMtlsHandshake(certUrl, pfxBuffer, password, pwCookies);
+    
+    // Sincroniza cookies de autorização de volta no Playwright
+    if (mtlsResult.setCookies && mtlsResult.setCookies.length > 0) {
+        const cookiesToInject = mtlsResult.setCookies.map(cookieStr => {
+            const [nameValue] = cookieStr.split(';');
+            const [name, ...valParts] = nameValue.split('=');
+            return { name: name.trim(), value: valParts.join('=').trim(), domain: '.acesso.gov.br', path: '/', secure: true };
         });
-        await page.waitForURL(url => url.href !== currentUrl, { timeout: 8000 });
-        console.log('[LOGIN] Sucesso no clique via JS!');
-        clickSuccess = true;
-      } catch (err) { }
+        await browser.addCookies(cookiesToInject);
     }
 
-    if (!clickSuccess) {
-      const u = new URL(page.url());
-      const authId = u.searchParams.get('authorization_id');
-      const clientId = u.searchParams.get('client_id');
-      if (authId && clientId) {
-        const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
-        console.log(`[LOGIN] Fallback Ativado: URL direta de certificado...`);
-        await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      }
-    }
+    console.log(`[LOGIN] Passo 3: Sucesso! Devolvendo fluxo ao Playwright na rota de autorização.`);
+    await page.goto(mtlsResult.location, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    console.log('[LOGIN] Aguardando validação mTLS do Serpro (Fast-Fail)...');
-    
+    console.log('[LOGIN] Passo 4: Aguardando o redirect final da aplicação FGTS Digital...');
     await page.waitForURL(url => {
         const href = url.href;
         return href.includes('fgtsdigital.sistema.gov.br/portal/acessogov?code=') || href.includes('acesso.gov.br/info/x509/');
-    }, { timeout: 60000 });
+    }, { timeout: 45000 });
 
     if (page.url().includes('acesso.gov.br/info/x509/')) {
         const e = new Error(`Certificado inválido ou revogado pelo Governo. URL: ${page.url()}`);
@@ -229,33 +202,27 @@ async function loginGovBr(pfxBase64, password) {
     }
     
     const urlFgtsCode = page.url();
-    console.log('[LOGIN] SUCESSO EXTREMO! Certificado reconhecido e Código capturado!');
+    console.log('[LOGIN] SUCESSO EXTREMO! Código de acesso obtido!');
 
-    const playwrightCookies = await browser.cookies();
+    const finalCookies = await browser.cookies();
     const jar = newCookieJar();
-    const setCookieArray = playwrightCookies.map(c => `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}`);
-    jar.set(setCookieArray);
+    jar.set(finalCookies.map(c => `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}`));
 
     await browser.close();
-    await cleanupMtls();
     
-    console.log('[LOGIN] Trocando o Código pelo Token JWT no motor HTTP...');
+    console.log('[LOGIN] Trocando o Código pelo Token JWT...');
     const fgtsUrlObj = new URL(urlFgtsCode);
-    const fgtsCode = fgtsUrlObj.searchParams.get('code');
-    const fgtsState = fgtsUrlObj.searchParams.get('state');
-
     const headersApiFgts = {
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
         'Referer': urlFgtsCode,
         'Origin': 'https://fgtsdigital.sistema.gov.br'
     };
 
-    const payloadToken = JSON.stringify({ code: fgtsCode, state: fgtsState });
+    const payloadToken = JSON.stringify({ code: fgtsUrlObj.searchParams.get('code'), state: fgtsUrlObj.searchParams.get('state') });
     await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: payloadToken });
     
-    console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! Acessando dados...');
     await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersApiFgts });
     await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts });
 
@@ -263,24 +230,13 @@ async function loginGovBr(pfxBase64, password) {
 
   } catch (error) {
     console.error('[LOGIN-ERRO]', error.message);
-    if (page) {
-      console.log('[DEBUG] A página travou nesta URL:', page.url());
-      try {
-        const bodyText = await page.evaluate(() => {
-          const errDiv = document.querySelector('.br-message.danger, .feedback-danger, .msg-erro, .error, #modal-erro');
-          return errDiv ? `ERRO: ${errDiv.innerText}` : document.body.innerText;
-        });
-        console.log('[DEBUG] Texto na tela:', bodyText.replace(/\n/g, ' ').substring(0, 300));
-      } catch (e) {}
-    }
     if (browser) await browser.close().catch(() => {});
-    await cleanupMtls();
     throw error;
   }
 }
 
 // ======================================================
-// ROTAS DE API
+// ROTAS E SERVIDOR API
 // ======================================================
 app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
   const { cnpj, pfxBase64, password, payloadBusca } = req.body
@@ -339,16 +295,12 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
     for (const st of statuses) {
         const urlVinculos = `https://fgtsdigital.sistema.gov.br/extrato/api/vinculos/${st}/,,,,0,0?num-pagina=1&tam-pagina=1000&campo-ordem=nmTrabalhador&ordem=asc`
         const resp = await httpRequest(urlVinculos, { method: 'GET', jar, headers: headersApiFgts })
-        
         if (resp.status === 200) {
             const dados = tryParseJson(resp.body)
             const lista = dados?.content || dados?.itens || dados || []
-            if (Array.isArray(lista)) {
-                lista.forEach(emp => { emp.statusSistema = st; todosEmpregados.push(emp); })
-            }
+            if (Array.isArray(lista)) lista.forEach(emp => { emp.statusSistema = st; todosEmpregados.push(emp); })
         }
     }
-
     res.json({ success: true, total: todosEmpregados.length, empregados: todosEmpregados })
 
   } catch(e) {
