@@ -173,7 +173,7 @@ async function loginGovBr(pfxBase64, password) {
 
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
     
-    // AS FLAGS ABAIXO MATAM OS ERROS DE DNS E SOCKS NO CLOUD RUN
+    // AS FLAGS ABAIXO MATAM OS ERROS DE DNS E SOCKS NO CLOUD RUN GEN 2
     browser = await chromium.launchPersistentContext('', {
       headless: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -183,8 +183,7 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-dev-shm-usage', 
         '--disable-gpu',
         '--disable-blink-features=AutomationControlled',
-        '--no-zygote',
-        '--single-process',
+        // ATENÇÃO: As flags --no-zygote e --single-process foram REMOVIDAS para não quebrar a rede no Gen 2!
         '--no-proxy-server',           // <-- GARANTE QUE NÃO USARÁ PROXY
         '--proxy-bypass-list=*',
         '--disable-features=AsyncDns', // <-- FORÇA O CHROMIUM A USAR O DNS DO CLOUD RUN (MATA O ERR_NAME_NOT_RESOLVED)
