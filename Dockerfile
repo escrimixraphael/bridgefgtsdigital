@@ -8,9 +8,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 
 # 4. A MÁGICA DEFINITIVA ACONTECE AQUI:
-# O valor "0" obriga o Playwright a guardar o Chromium DENTRO da pasta do projeto
-# Isso tem que ficar ANTES do 'npm install'.
 ENV PLAYWRIGHT_BROWSERS_PATH=0
+# Estas três linhas são OBRIGATÓRIAS para o Playwright conseguir acessar a rede no Cloud Run Gen2
+ENV DBUS_FATAL_WARNINGS=0
+ENV DISABLE_WAYLAND=1
+ENV NO_UPDATE_NOTIFIER=true
 
 # 5. Copia os arquivos de dependência
 COPY package*.json ./
