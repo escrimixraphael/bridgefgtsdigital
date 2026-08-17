@@ -30,7 +30,6 @@ function apiKeyValida(recebida) {
 }
 
 function requireApiKey(req, res, next) {
-  // Aceita chaves nos headers 'x-api-key', 'fgts-api-key' ou no padrão 'Authorization: Bearer <CHAVE>'
   let recebida = req.headers['x-api-key'] || req.headers['fgts-api-key'] || req.headers['authorization'];
   
   if (recebida && recebida.startsWith('Bearer ')) {
@@ -102,7 +101,6 @@ async function makePfxTls(pfxBase64, password) {
   const pfxBuffer = Buffer.from(pfxBase64, 'base64');
   console.log('[LOGIN] Iniciando modernização blindada do certificado...');
   
-  // No Cloud Run, o os.tmpdir() aponta para um disco em memória ultra-rápido
   const tmpDir = os.tmpdir();
   const tmpId = crypto.randomUUID();
   const inPath = path.join(tmpDir, `in_${tmpId}.pfx`);
@@ -174,14 +172,21 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 2 OK: Arquivo salvo no servidor.');
 
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
+    
+    // AQUI ESTÁ A "FÓRMULA MÁGICA" COMPLETA E UNIFICADA DE REDE E ISOLAMENTO PARA CLOUD RUN:
     browser = await chromium.launchPersistentContext('', {
       headless: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       args: [
         '--no-sandbox', 
-        '--disable-blink-features=AutomationControlled', 
+        '--disable-setuid-sandbox',
         '--disable-dev-shm-usage', 
         '--disable-gpu',
+        '--disable-blink-features=AutomationControlled',
+        '--no-zygote',
+        '--single-process',
+        '--proxy-server=direct://',
+        '--proxy-bypass-list=*',
         '--dns-prefetch-disable'
       ], 
       ignoreHTTPSErrors: true,
@@ -203,7 +208,6 @@ async function loginGovBr(pfxBase64, password) {
     
     console.log('[LOGIN] Analisando a tela para encontrar a porta de entrada mTLS...');
     
-    // Tenta esperar o redirecionamento automático
     try {
       await page.waitForURL(/authorization_id=/, { timeout: 15000 });
     } catch(e) {
@@ -381,5 +385,4 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }))
 
-// AJUSTE CRÍTICO AQUI PARA O GOOGLE CLOUD RUN: Escutar em '0.0.0.0'
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Bridge FGTS Digital RPA rodando na porta ${PORT} (0.0.0.0)`))
