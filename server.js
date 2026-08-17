@@ -8,18 +8,13 @@ import { execSync } from 'node:child_process'
 import dns from 'node:dns'
 import { chromium } from 'playwright'
 
-// ======================================================
-// CONFIGURAÇÃO GLOBAL (Resolve DNS do Cloud Run Gen 2)
-// ======================================================
-dns.setDefaultResultOrder('ipv4first'); // Garante que o Node e o Proxy do Playwright achem o IP correto sem timeout de IPv6
+// Resolve DNS de IPv6 do Cloud Run
+dns.setDefaultResultOrder('ipv4first'); 
 
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '50mb' }))
 
-// ======================================================
-// CONFIGURAÇÃO E SEGURANÇA
-// ======================================================
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '9c6c38a65f8052500b7d4c2aff0b87fa'
 const FGTS_API_KEY = process.env.FGTS_API_KEY || '5341b41fa01513c5b3e23f6dc35b8e94'
 const PORT = process.env.PORT || 10000 
@@ -44,14 +39,10 @@ function requireApiKey(req, res, next) {
 function classifyError(err, stage) {
   const code = err?.code || ''
   const msg = err?.message || String(err)
-  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão ao acessar Gov.br/FGTS.' }
-  if (code.startsWith('ERR_TLS') || /handshake|alert|SSL routines/i.test(msg)) return { errorType: 'TLS_HANDSHAKE_ERROR', stage, code: code || 'TLS', message: 'Falha no handshake TLS (Certificado).' }
-  return { errorType: 'BRIDGE_INTERNAL', stage, code: code || 'UNKNOWN', message: msg, raw: msg }
+  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão.' }
+  return { errorType: 'BRIDGE_INTERNAL', stage, code: code || 'UNKNOWN', message: msg }
 }
 
-// ======================================================
-// FUNÇÕES AUXILIARES (HTTP e JSON)
-// ======================================================
 function tryParseJson(str) {
   try { return JSON.parse(str); } catch (e) { return str; }
 }
@@ -92,71 +83,69 @@ async function httpRequest(url, options) {
 }
 
 // ======================================================
-// CONVERSOR DE CERTIFICADO LEGADO PARA O PLAYWRIGHT
+// NOVO ALGORITMO: EXTRAÇÃO PARA PEM (CERTIFICADO E CHAVE)
 // ======================================================
-async function makePfxTls(pfxBase64, password) {
+async function makePemTls(pfxBase64, password) {
   const pfxBuffer = Buffer.from(pfxBase64, 'base64');
-  console.log('[LOGIN] Iniciando modernização blindada do certificado...');
+  console.log('[LOGIN] Extraindo certificado e chave privada para o formato PEM puro...');
   
   const tmpDir = os.tmpdir();
   const tmpId = crypto.randomUUID();
   const inPath = path.join(tmpDir, `in_${tmpId}.pfx`);
-  const pemPath = path.join(tmpDir, `temp_${tmpId}.pem`);
-  const outPath = path.join(tmpDir, `out_${tmpId}.pfx`);
+  const certPath = path.join(tmpDir, `cert_${tmpId}.pem`);
+  const keyPath = path.join(tmpDir, `key_${tmpId}.pem`);
   const passPath = path.join(tmpDir, `pass_${tmpId}.txt`);
   
   try {
     await fs.writeFile(inPath, pfxBuffer);
     await fs.writeFile(passPath, password);
     
-    console.log('[LOGIN] Extraindo chaves do PFX antigo...');
+    // O parâmetro -nodes remove a criptografia da chave, garantindo que o NodeJS leia 100% liso
     try {
-      execSync(`openssl pkcs12 -in "${inPath}" -out "${pemPath}" -nodes -legacy -passin file:"${passPath}"`, { stdio: 'pipe' });
+      execSync(`openssl pkcs12 -in "${inPath}" -clcerts -nokeys -out "${certPath}" -legacy -passin file:"${passPath}"`, { stdio: 'pipe' });
+      execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -legacy -passin file:"${passPath}"`, { stdio: 'pipe' });
     } catch (e1) {
-      console.log('[LOGIN] Tentativa com -legacy falhou, tentando padrão...');
-      execSync(`openssl pkcs12 -in "${inPath}" -out "${pemPath}" -nodes -passin file:"${passPath}"`, { stdio: 'pipe' });
+      console.log('[LOGIN] Fallback: Tentando extração via padrão OpenSSL 3...');
+      execSync(`openssl pkcs12 -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
+      execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
     }
     
-    console.log('[LOGIN] Recriando PFX com criptografia AES-256 (Padrão Playwright)...');
-    execSync(`openssl pkcs12 -export -in "${pemPath}" -out "${outPath}" -passout file:"${passPath}" -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg SHA256`, { stdio: 'pipe' });
-    
-    const modernBuffer = await fs.readFile(outPath);
-    
-    await Promise.all([fs.unlink(inPath).catch(()=>{}), fs.unlink(pemPath).catch(()=>{}), fs.unlink(outPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{})]);
-    
-    console.log('[LOGIN] SUCESSO! Certificado modernizado para AES-256!');
-    return { pfx: modernBuffer, passphrase: password };
+    console.log('[LOGIN] Sucesso absoluto! PEM extraído e pronto para injeção mTLS.');
+    return { inPath, certPath, keyPath, passPath };
     
   } catch (err) {
     const linuxError = err.stderr ? err.stderr.toString() : err.message;
-    console.error('[LOGIN-ERRO] Falha crítica no OpenSSL Linux:', linuxError);
-    await Promise.all([fs.unlink(inPath).catch(()=>{}), fs.unlink(pemPath).catch(()=>{}), fs.unlink(outPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{})]);
-    throw new Error(`Falha ao modernizar certificado. Detalhes: ${linuxError}`);
+    console.error('[LOGIN-ERRO] Falha crítica na extração PEM:', linuxError);
+    await Promise.all([fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}), fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{})]);
+    throw new Error(`Falha ao ler certificado digital. Verifique a senha ou validade.`);
   }
 }
 
 // ======================================================
-// LOGIN GOV.BR E FGTS DIGITAL (VIA PLAYWRIGHT - BYPASS WAF)
+// MOTOR DE LOGIN COM WAF BYPASS E HTTP/2 DISABLED
 // ======================================================
 async function loginGovBr(pfxBase64, password) {
   console.log('[LOGIN] Iniciando motor blindado (Playwright) para bypass do WAF...');
 
   let browser;
   let page; 
-  const tmpDir = os.tmpdir();
-  const certId = crypto.randomUUID();
-  const certPath = path.join(tmpDir, `cert_${certId}.pfx`);
+  let mtls = null;
+
+  const cleanupMtls = async () => {
+    if (mtls) {
+      await Promise.all([
+        fs.unlink(mtls.inPath).catch(()=>{}),
+        fs.unlink(mtls.certPath).catch(()=>{}),
+        fs.unlink(mtls.keyPath).catch(()=>{}),
+        fs.unlink(mtls.passPath).catch(()=>{})
+      ]);
+    }
+  };
 
   try {
-    console.log('[LOGIN] Passo 1: Verificando/Convertendo o Certificado Digital...');
-    const mtls = await makePfxTls(pfxBase64, password);
-    console.log('[LOGIN] Passo 1 OK: Certificado validado e convertido para formato seguro.');
+    mtls = await makePemTls(pfxBase64, password);
 
-    console.log('[LOGIN] Passo 2: Escrevendo arquivo PFX temporário...');
-    await fs.writeFile(certPath, mtls.pfx);
-    console.log('[LOGIN] Passo 2 OK: Arquivo salvo no servidor.');
-
-    console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
+    console.log('[LOGIN] Solicitando abertura do motor Chromium no Linux...');
     
     browser = await chromium.launchPersistentContext('', {
       headless: true,
@@ -166,22 +155,22 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage', 
         '--disable-gpu',
-        '--disable-blink-features=AutomationControlled'
-        // IMPORTANTE: Removidas as flags de bypass de proxy para permitir que o Playwright injete o Certificado!
+        '--disable-blink-features=AutomationControlled',
+        '--disable-http2' // A CORREÇÃO DE OURO: Mata o bug de ALPN (HTTP/2) do Playwright Proxy
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
-        { origin: 'https://sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
-        { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
-        { origin: 'https://certificado.sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
-        { origin: 'https://acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
+        { origin: 'https://sso.acesso.gov.br', certPath: mtls.certPath, keyPath: mtls.keyPath },
+        { origin: 'https://certificados.acesso.gov.br', certPath: mtls.certPath, keyPath: mtls.keyPath },
+        { origin: 'https://certificado.sso.acesso.gov.br', certPath: mtls.certPath, keyPath: mtls.keyPath },
+        { origin: 'https://acesso.gov.br', certPath: mtls.certPath, keyPath: mtls.keyPath }
       ]
     });
-    console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
-
+    
+    console.log('[LOGIN] Motor preparado e HTTP/2 desativado.');
     page = browser.pages()[0] || await browser.newPage();
 
-    console.log('[LOGIN] Passo 4: Acessando URL de autorização do Gov.br...');
+    console.log('[LOGIN] Acessando URL de autorização do Gov.br...');
     const nonce = crypto.randomUUID();
     const state = crypto.randomUUID();
     const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${nonce}&state=${state}`;
@@ -191,11 +180,9 @@ async function loginGovBr(pfxBase64, password) {
     try {
       await page.waitForURL(/authorization_id=/, { timeout: 15000 });
       await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
-    } catch(e) {
-      console.log('[LOGIN] Aviso: A tela demorou para estabilizar, prosseguindo...');
-    }
+    } catch(e) { }
 
-    console.log('[LOGIN] Passo 5: Acionando login por certificado (Estratégia Tripla)...');
+    console.log('[LOGIN] Acionando login por certificado (Estratégia Tripla)...');
     
     let clickSuccess = false;
     const currentUrl = page.url();
@@ -206,18 +193,15 @@ async function loginGovBr(pfxBase64, password) {
       console.log('[LOGIN] Sucesso no clique nativo! URL alterada.');
       clickSuccess = true;
     } catch (e) {
-      console.log('[LOGIN] Clique nativo falhou ou não redirecionou. Tentando via JS Eval...');
       try {
         await page.evaluate(() => {
           const btn = document.getElementById('login-certificate');
           if (btn) btn.click();
         });
         await page.waitForURL(url => url.href !== currentUrl, { timeout: 8000 });
-        console.log('[LOGIN] Sucesso no clique via JS! URL alterada.');
+        console.log('[LOGIN] Sucesso no clique via JS!');
         clickSuccess = true;
-      } catch (err) {
-        console.log('[LOGIN] Clique JS também falhou em navegar. Forçando URL direta (Fallback Final)...');
-      }
+      } catch (err) { }
     }
 
     if (!clickSuccess) {
@@ -226,28 +210,26 @@ async function loginGovBr(pfxBase64, password) {
       const clientId = u.searchParams.get('client_id');
       if (authId && clientId) {
         const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
-        console.log(`[LOGIN] Fallback Ativado: Indo direto para ${certUrl}`);
+        console.log(`[LOGIN] Fallback Ativado: URL direta de certificado...`);
         await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      } else {
-        console.log('[LOGIN] ERRO CRÍTICO: Parâmetros auth_id / client_id ausentes da URL.');
       }
     }
 
-    console.log('[LOGIN] Passo 6: Aguardando validação mTLS do Serpro (Fast-Fail de 90s)...');
+    console.log('[LOGIN] Aguardando validação mTLS do Serpro (Fast-Fail)...');
     
     await page.waitForURL(url => {
         const href = url.href;
         return href.includes('fgtsdigital.sistema.gov.br/portal/acessogov?code=') || href.includes('acesso.gov.br/info/x509/');
-    }, { timeout: 90000 });
+    }, { timeout: 60000 });
 
     if (page.url().includes('acesso.gov.br/info/x509/')) {
-        const e = new Error(`O Governo rejeitou o certificado digital. Verifique a validade ou a senha. URL travada: ${page.url()}`);
+        const e = new Error(`Certificado inválido ou revogado pelo Governo. URL: ${page.url()}`);
         e.pfxStage = 'PFX_INVALID';
         throw e;
     }
     
     const urlFgtsCode = page.url();
-    console.log('[LOGIN] Passo 6 OK: SUCESSO EXTREMO! Código Serpro capturado!');
+    console.log('[LOGIN] SUCESSO EXTREMO! Certificado reconhecido e Código capturado!');
 
     const playwrightCookies = await browser.cookies();
     const jar = newCookieJar();
@@ -255,9 +237,9 @@ async function loginGovBr(pfxBase64, password) {
     jar.set(setCookieArray);
 
     await browser.close();
-    await fs.unlink(certPath).catch(() => {});
+    await cleanupMtls();
     
-    console.log('[LOGIN] Passo 7: Trocando o Código pelo Token JWT no motor HTTP...');
+    console.log('[LOGIN] Trocando o Código pelo Token JWT no motor HTTP...');
     const fgtsUrlObj = new URL(urlFgtsCode);
     const fgtsCode = fgtsUrlObj.searchParams.get('code');
     const fgtsState = fgtsUrlObj.searchParams.get('state');
@@ -273,11 +255,10 @@ async function loginGovBr(pfxBase64, password) {
     const payloadToken = JSON.stringify({ code: fgtsCode, state: fgtsState });
     await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: payloadToken });
     
-    console.log('[LOGIN] Habilitando Acesso e Sincronizando Perfil...');
+    console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! Acessando dados...');
     await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersApiFgts });
     await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts });
 
-    console.log('[LOGIN] SESSÃO FGTS ESTABELECIDA COM SUCESSO! O Robô vai buscar os dados agora.');
     return { jar, finalUrl: urlFgtsCode, headersApiFgts };
 
   } catch (error) {
@@ -287,19 +268,19 @@ async function loginGovBr(pfxBase64, password) {
       try {
         const bodyText = await page.evaluate(() => {
           const errDiv = document.querySelector('.br-message.danger, .feedback-danger, .msg-erro, .error, #modal-erro');
-          return errDiv ? `ERRO NA TELA: ${errDiv.innerText}` : document.body.innerText;
+          return errDiv ? `ERRO: ${errDiv.innerText}` : document.body.innerText;
         });
-        console.log('[DEBUG] Texto visível na tela (resumo):', bodyText.replace(/\n/g, ' ').substring(0, 500));
+        console.log('[DEBUG] Texto na tela:', bodyText.replace(/\n/g, ' ').substring(0, 300));
       } catch (e) {}
     }
     if (browser) await browser.close().catch(() => {});
-    await fs.unlink(certPath).catch(() => {});
+    await cleanupMtls();
     throw error;
   }
 }
 
 // ======================================================
-// ROTA 1: Extrato FGTS Digital (Guias e Valores)
+// ROTAS DE API
 // ======================================================
 app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
   const { cnpj, pfxBase64, password, payloadBusca } = req.body
@@ -307,7 +288,6 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
 
   try {
     const { jar, headersApiFgts } = await loginGovBr(pfxBase64, password)
-
     const cnpjNum = cnpj.replace(/\D/g,'')
     const empId = `${cnpjNum.substring(0,8)}1`
     
@@ -345,17 +325,13 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
   }
 });
 
-// ======================================================
-// ROTA 2: Empregados e Vínculos (Ativos, Afastados, Desligados)
-// ======================================================
 app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
   const { cnpj, pfxBase64, password } = req.body
   if (!cnpj) return res.status(400).json({ success: false, erro: 'CNPJ obrigatório' })
 
   try {
     const { jar, headersApiFgts } = await loginGovBr(pfxBase64, password)
-    
-    console.log(`[FGTS-RPA] Extraindo Vínculos de Funcionários para o CNPJ ${cnpj}...`)
+    console.log(`[FGTS-RPA] Extraindo Vínculos para o CNPJ ${cnpj}...`)
 
     const statuses = ['ativo', 'afastado', 'desligado']
     const todosEmpregados = []
@@ -368,15 +344,11 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
             const dados = tryParseJson(resp.body)
             const lista = dados?.content || dados?.itens || dados || []
             if (Array.isArray(lista)) {
-                lista.forEach(emp => {
-                    emp.statusSistema = st
-                    todosEmpregados.push(emp)
-                })
+                lista.forEach(emp => { emp.statusSistema = st; todosEmpregados.push(emp); })
             }
         }
     }
 
-    console.log(`[FGTS-RPA] Extração concluída! Total de empregados encontrados: ${todosEmpregados.length}`)
     res.json({ success: true, total: todosEmpregados.length, empregados: todosEmpregados })
 
   } catch(e) {
@@ -386,5 +358,4 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }))
-
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Bridge FGTS Digital RPA rodando na porta ${PORT} (0.0.0.0)`))
