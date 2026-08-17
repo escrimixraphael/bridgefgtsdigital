@@ -173,7 +173,7 @@ async function loginGovBr(pfxBase64, password) {
 
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
     
-    // AQUI ESTÁ A "FÓRMULA MÁGICA" COMPLETA E UNIFICADA DE REDE E ISOLAMENTO PARA CLOUD RUN:
+    // AS FLAGS ABAIXO MATAM OS ERROS DE DNS E SOCKS NO CLOUD RUN
     browser = await chromium.launchPersistentContext('', {
       headless: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -185,8 +185,10 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-blink-features=AutomationControlled',
         '--no-zygote',
         '--single-process',
-        '--proxy-server=direct://',
+        '--no-proxy-server',           // <-- GARANTE QUE NÃO USARÁ PROXY
         '--proxy-bypass-list=*',
+        '--disable-features=AsyncDns', // <-- FORÇA O CHROMIUM A USAR O DNS DO CLOUD RUN (MATA O ERR_NAME_NOT_RESOLVED)
+        '--disable-async-dns',         // <-- FALLBACK PARA GARANTIR
         '--dns-prefetch-disable'
       ], 
       ignoreHTTPSErrors: true,
