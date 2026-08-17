@@ -1,20 +1,22 @@
-# Usa a imagem oficial do Node 20
-FROM node:20-bullseye
+# Usa a imagem oficial do Node 22 com Debian 12 (Bookworm)
+FROM node:22-bookworm
 
-# Atualiza o sistema e instala o OpenSSL (Vital para o seu código que usa execSync)
+# Atualiza o sistema e instala o OpenSSL
 RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 
 # Cria e define a pasta de trabalho dentro do container
 WORKDIR /app
 
-# Copia os arquivos de dependência e instala os pacotes do Node
+# Copia os arquivos de dependência
 COPY package*.json ./
-RUN npm install
 
-# Instala os navegadores do Playwright e todas as dependências do sistema necessárias para rodar o Chromium
+# Instala as dependências do Node (Ignorando falhas de scripts pós-instalação se houver)
+RUN npm install --ignore-scripts
+
+# Instala o navegador Chromium e suas dependências de sistema
 RUN npx playwright install chromium --with-deps
 
-# Copia o resto do seu código (server.js, etc)
+# Copia o resto do seu código
 COPY . .
 
 # Expõe a porta que sua API usa
