@@ -16,7 +16,6 @@ app.use(express.json({ limit: '50mb' }))
 // ======================================================
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '9c6c38a65f8052500b7d4c2aff0b87fa'
 const FGTS_API_KEY = process.env.FGTS_API_KEY || '5341b41fa01513c5b3e23f6dc35b8e94'
-// O Google Cloud Run injeta a variável PORT automaticamente (geralmente 8080)
 const PORT = process.env.PORT || 10000 
 
 function apiKeyValida(recebida) {
@@ -31,14 +30,8 @@ function apiKeyValida(recebida) {
 
 function requireApiKey(req, res, next) {
   let recebida = req.headers['x-api-key'] || req.headers['fgts-api-key'] || req.headers['authorization'];
-  
-  if (recebida && recebida.startsWith('Bearer ')) {
-    recebida = recebida.replace('Bearer ', '');
-  }
-
-  if (!apiKeyValida(recebida)) {
-    return res.status(403).json({ success: false, error: 'Acesso negado: Chave API inválida.' });
-  }
+  if (recebida && recebida.startsWith('Bearer ')) recebida = recebida.replace('Bearer ', '');
+  if (!apiKeyValida(recebida)) return res.status(403).json({ success: false, error: 'Acesso negado: Chave API inválida.' });
   next()
 }
 
@@ -70,9 +63,7 @@ function newCookieJar() {
     },
     getCookieString() {
       let str = '';
-      for (const [name, value] of this.cookies.entries()) {
-        str += `${name}=${value}; `;
-      }
+      for (const [name, value] of this.cookies.entries()) str += `${name}=${value}; `;
       return str;
     },
     extractFromResponse(headers) {
@@ -125,12 +116,7 @@ async function makePfxTls(pfxBase64, password) {
     
     const modernBuffer = await fs.readFile(outPath);
     
-    await Promise.all([
-      fs.unlink(inPath).catch(()=>{}),
-      fs.unlink(pemPath).catch(()=>{}),
-      fs.unlink(outPath).catch(()=>{}),
-      fs.unlink(passPath).catch(()=>{})
-    ]);
+    await Promise.all([fs.unlink(inPath).catch(()=>{}), fs.unlink(pemPath).catch(()=>{}), fs.unlink(outPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{})]);
     
     console.log('[LOGIN] SUCESSO! Certificado modernizado para AES-256!');
     return { pfx: modernBuffer, passphrase: password };
@@ -138,14 +124,7 @@ async function makePfxTls(pfxBase64, password) {
   } catch (err) {
     const linuxError = err.stderr ? err.stderr.toString() : err.message;
     console.error('[LOGIN-ERRO] Falha crítica no OpenSSL Linux:', linuxError);
-    
-    await Promise.all([
-      fs.unlink(inPath).catch(()=>{}),
-      fs.unlink(pemPath).catch(()=>{}),
-      fs.unlink(outPath).catch(()=>{}),
-      fs.unlink(passPath).catch(()=>{})
-    ]);
-    
+    await Promise.all([fs.unlink(inPath).catch(()=>{}), fs.unlink(pemPath).catch(()=>{}), fs.unlink(outPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{})]);
     throw new Error(`Falha ao modernizar certificado. Detalhes: ${linuxError}`);
   }
 }
@@ -173,7 +152,6 @@ async function loginGovBr(pfxBase64, password) {
 
     console.log('[LOGIN] Passo 3: Solicitando abertura do motor Chromium no Linux...');
     
-    // AS FLAGS ABAIXO MATAM OS ERROS DE DNS E SOCKS NO CLOUD RUN GEN 2
     browser = await chromium.launchPersistentContext('', {
       headless: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -183,18 +161,19 @@ async function loginGovBr(pfxBase64, password) {
         '--disable-dev-shm-usage', 
         '--disable-gpu',
         '--disable-blink-features=AutomationControlled',
-        // ATENÇÃO: As flags --no-zygote e --single-process foram REMOVIDAS para não quebrar a rede no Gen 2!
-        '--no-proxy-server',           // <-- GARANTE QUE NÃO USARÁ PROXY
+        '--no-proxy-server',
         '--proxy-bypass-list=*',
-        '--disable-features=AsyncDns', // <-- FORÇA O CHROMIUM A USAR O DNS DO CLOUD RUN (MATA O ERR_NAME_NOT_RESOLVED)
-        '--disable-async-dns',         // <-- FALLBACK PARA GARANTIR
+        '--disable-features=AsyncDns', // Impede erro de DNS no Cloud Run Gen 2
+        '--disable-async-dns',
         '--dns-prefetch-disable'
       ], 
       ignoreHTTPSErrors: true,
       clientCertificates: [
+        // Mapeamos todos os endpoints possíveis para não haver chance de falha no vínculo mTLS
         { origin: 'https://sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
-        // Corrigido para certificado.sso (singular e com .sso)
-        { origin: 'https://certificado.sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
+        { origin: 'https://certificados.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
+        { origin: 'https://certificado.sso.acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase },
+        { origin: 'https://acesso.gov.br', pfxPath: certPath, passphrase: mtls.passphrase }
       ]
     });
     console.log('[LOGIN] Passo 3 OK: Navegador Chromium abriu com sucesso!');
@@ -208,32 +187,39 @@ async function loginGovBr(pfxBase64, password) {
 
     await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     
-    console.log('[LOGIN] Analisando a tela para encontrar a porta de entrada mTLS...');
-    
     try {
       await page.waitForURL(/authorization_id=/, { timeout: 15000 });
     } catch(e) {
-      console.log('[LOGIN] Redirecionamento atrasado. Tentando forçar o clique...');
+      console.log('[LOGIN] Redirecionamento atrasado. Aguardando processamento da tela...');
     }
 
-    const currentUrl = new URL(page.url());
-    let authId = currentUrl.searchParams.get('authorization_id');
-    let clientId = currentUrl.searchParams.get('client_id');
+    console.log('[LOGIN] Passo 5: Acionando login por certificado (Bypass WAF)...');
+    
+    // Tenta primeiro clicar no botão oficial para manter os cookies de sessão que o Gov.br gera no meio do caminho
+    let clickSuccess = false;
+    try {
+        await page.waitForSelector('text="Seu certificado digital"', { timeout: 5000 });
+        await page.locator('text="Seu certificado digital"').first().click({ force: true });
+        console.log('[LOGIN] Botão de certificado clicado com sucesso!');
+        clickSuccess = true;
+    } catch (e) {
+        console.log('[LOGIN] Botão não encontrado ou WAF bloqueou a interface. Tentando saltar...');
+    }
 
-    if (authId && clientId) {
-        // CORREÇÃO CRÍTICA AQUI: Alterado de certificados.acesso.gov.br para certificado.sso.acesso.gov.br
-        const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
-        console.log(`[LOGIN] Passo 5: Saltando direto para o motor de certificados (Bypass WAF)...`);
+    // Se o clique falhar, faz o salto forçado direto pela URL
+    if (!clickSuccess) {
+        const currentUrl = new URL(page.url());
+        let authId = currentUrl.searchParams.get('authorization_id');
+        let clientId = currentUrl.searchParams.get('client_id');
         
-        await page.setExtraHTTPHeaders({ 'Referer': 'https://sso.acesso.gov.br/' });
-        await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    } else {
-        console.log('[LOGIN] Passo 5: auth_id não apareceu. Forçando clique no botão do certificado...');
-        try {
-          await page.waitForSelector('text="Seu certificado digital"', { timeout: 10000 });
-          await page.getByText('Seu certificado digital').first().click({ force: true });
-        } catch (e) {
-          console.log('[LOGIN] Botão de certificado não encontrado, a tela deve estar em transição.');
+        if (authId && clientId) {
+            // Voltamos ao domínio plural que é o correto mTLS, o erro de DNS resolvido pelas flags do passo 3 
+            const certUrl = `https://certificados.acesso.gov.br/login?client_id=${clientId}&authorization_id=${authId}`;
+            console.log(`[LOGIN] Saltando direto pela URL de certificado...`);
+            await page.setExtraHTTPHeaders({ 'Referer': 'https://sso.acesso.gov.br/' });
+            await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        } else {
+            console.log('[LOGIN] ERRO: auth_id não encontrado, a navegação pode falhar.');
         }
     }
 
@@ -276,7 +262,6 @@ async function loginGovBr(pfxBase64, password) {
 
   } catch (error) {
     console.error('[LOGIN-ERRO]', error);
-    
     if (page) {
       console.log('[DEBUG] A página travou nesta URL:', page.url());
       try {
@@ -285,11 +270,8 @@ async function loginGovBr(pfxBase64, password) {
           return errDiv ? `ERRO NA TELA: ${errDiv.innerText}` : document.body.innerText;
         });
         console.log('[DEBUG] Texto visível na tela do governo (resumo):', bodyText.replace(/\n/g, ' ').substring(0, 500));
-      } catch (e) {
-        console.log('[DEBUG] Não foi possível extrair o texto da tela.');
-      }
+      } catch (e) {}
     }
-    
     if (browser) await browser.close().catch(() => {});
     await fs.unlink(certPath).catch(() => {});
     throw error;
@@ -324,7 +306,6 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
     const guiasArray = Array.isArray(listaGuias) ? listaGuias : (listaGuias?.content || listaGuias?.itens || [])
 
     const detalhes = []
-    
     for (const g of guiasArray.slice(0, 5)) {
       const idGuia = g.id || g.idGuia || g.numeroGuia
       if (!idGuia) continue
@@ -366,7 +347,6 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
         if (resp.status === 200) {
             const dados = tryParseJson(resp.body)
             const lista = dados?.content || dados?.itens || dados || []
-            
             if (Array.isArray(lista)) {
                 lista.forEach(emp => {
                     emp.statusSistema = st
@@ -377,7 +357,6 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
     }
 
     console.log(`[FGTS-RPA] Extração concluída! Total de empregados encontrados: ${todosEmpregados.length}`)
-
     res.json({ success: true, total: todosEmpregados.length, empregados: todosEmpregados })
 
   } catch(e) {
