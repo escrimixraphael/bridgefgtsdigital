@@ -139,9 +139,13 @@ async function executeMtlsHandshake(url, certPem, keyPem, playwrightCookies) {
       port: 443,
       path: u.pathname + u.search,
       method: 'GET',
-      cert: certPem, // Passando o texto puro do Certificado
-      key: keyPem,   // Passando o texto puro da Chave
+      cert: certPem, 
+      key: keyPem,   
       rejectUnauthorized: false,
+      servername: u.hostname, // <--- AJUSTE 1: Obriga o envio do nome do servidor (SNI)
+      minVersion: 'TLSv1.2',  // <--- AJUSTE 2: Força o uso do TLS 1.2 (Compatível com o Serpro)
+      maxVersion: 'TLSv1.2',  
+      ciphers: 'DEFAULT:@SECLEVEL=0', // <--- AJUSTE 3: Desativa a trava de segurança severa do Node 22
       secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
       headers: {
         'Cookie': cookieStr,
@@ -162,6 +166,11 @@ async function executeMtlsHandshake(url, certPem, keyPem, playwrightCookies) {
         if (res.statusCode >= 300 && res.statusCode < 400 && location) {
            resolve({ success: true, location, setCookies });
         } else {
+           // Debug extra para vermos o que o governo respondeu
+           if (res.statusCode === 200) {
+               console.log('[DEBUG GOV] O governo ignorou o certificado. HTML retornado:', body.substring(0, 150).replace(/\n/g, ' '));
+           }
+
            if (body.includes('acesso.gov.br/info/x509') || body.includes('Revogado')) {
                const e = new Error('Certificado Rejeitado/Revogado pelo Gov.br.');
                e.pfxStage = 'PFX_INVALID';
