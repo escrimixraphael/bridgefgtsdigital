@@ -226,15 +226,20 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 1: Acessando Autorização Gov.br para gerar sessão...');
     const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${crypto.randomUUID()}&state=${crypto.randomUUID()}`;
 
-    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForURL(/authorization_id=/, { timeout: 15000 }).catch(() => {});
+        await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Aumentamos o tempo de tolerância para o Gov.br redirecionar de 15s para 30s
+    await page.waitForURL(/authorization_id=/, { timeout: 30000 }).catch(() => {});
     
     const authUrlAtual = new URL(page.url());
     const authId = authUrlAtual.searchParams.get('authorization_id');
     const cId = authUrlAtual.searchParams.get('client_id');
 
-    if (!authId || !cId) throw new Error(`Não capturou authorization_id do SSO. URL: ${page.url()}`);
-
+    if (!authId || !cId) {
+        // Se falhar, captura a tela para vermos se tem algum bloqueio/captcha
+        const htmlDebug = await page.content();
+        console.log('[DEBUG GOV] Tela presa no passo 1. HTML retornado:', htmlDebug.substring(0, 300).replace(/\n/g, ' '));
+        throw new Error(`Não capturou authorization_id do SSO. URL: ${page.url()}`);
+    }
     console.log(`[LOGIN] Passo 2: Sessão capturada! Pausando navegador e assumindo Node.js...`);
     const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${cId}&authorization_id=${authId}`;
     const pwCookies = await browser.cookies();
