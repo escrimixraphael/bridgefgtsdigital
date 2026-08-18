@@ -1,3 +1,4 @@
+cat << 'EOF' > server.js
 import express from 'express'
 import cors from 'cors'
 import crypto from 'node:crypto'
@@ -115,7 +116,6 @@ async function executeMtlsHandshake(url, certPemPath, keyPemPath, playwrightCook
   console.log(`[LOGIN] Disparando Handshake mTLS via cURL para Gov.br...`);
   return new Promise((resolve, reject) => {
     try {
-      // Usamos todos os cookies agora, nada de filtrar
       const cookieStr = playwrightCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
       const curlCmd = `curl -s -i -k -L --max-redirs 0 \
@@ -317,3 +317,4 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }))
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Bridge FGTS Digital RPA rodando na porta ${PORT} (0.0.0.0)`))
+EOF
