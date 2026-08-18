@@ -1,26 +1,12 @@
-# Usa a imagem oficial do Node 22 com Debian 12 (Bookworm)
 FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
-# Atualiza o sistema e instala o OpenSSL
-RUN apt-get update && apt-get install -y curl
+# Instala o curl e openssl na marra
+RUN apt-get update && apt-get install -y curl openssl
 
-# Cria e define a pasta de trabalho dentro do container
 WORKDIR /app
-
-# Copia os arquivos de dependência
 COPY package*.json ./
-
-# Instala as dependências do Node (Ignorando falhas de scripts pós-instalação se houver)
-RUN npm install --ignore-scripts
-
-# Instala o navegador Chromium e suas dependências de sistema
-RUN npx playwright install chromium --with-deps
-
-# Copia o resto do seu código
+RUN npm install
 COPY . .
 
-# Expõe a porta que sua API usa
 EXPOSE 10000
-
-# Comando para iniciar sua API
-CMD ["node", "server.js"]
+CMD ["npm", "start"]
