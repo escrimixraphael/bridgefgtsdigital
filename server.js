@@ -77,9 +77,6 @@ async function httpRequest(url, options) {
   return { status: response.status, headers: response.headers, body: text };
 }
 
-// ======================================================
-// EXTRAÇÃO DE PEM VIA OPENSSL (RETORNA CAMINHOS DOS ARQUIVOS)
-// ======================================================
 async function convertPfxToPem(pfxBase64, password) {
   const buf = Buffer.from(pfxBase64, 'base64');
   const tmpDir = os.tmpdir();
@@ -93,53 +90,35 @@ async function convertPfxToPem(pfxBase64, password) {
   await fs.writeFile(passPath, password);
   
   try {
-      console.log('[LOGIN] Convertendo PFX legado para PEM via OpenSSL...');
+      console.log('[LOGIN] Convertendo PFX legado para PEM (Cadeia ICP-Brasil Completa)...');
       try {
-          execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
+          execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -nokeys -out "${certPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
           execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
       } catch (err) {
-          execSync(`openssl pkcs12 -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`);
+          execSync(`openssl pkcs12 -in "${inPath}" -nokeys -out "${certPath}" -passin file:"${passPath}"`);
           execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`);
       }
-      // Retorna os caminhos para o CURL usar, e uma função para limpar tudo no final
       return { 
-          certPath, 
-          keyPath, 
+          certPath, keyPath, 
           cleanup: async () => {
-              await Promise.all([
-                  fs.unlink(inPath).catch(()=>{}),
-                  fs.unlink(certPath).catch(()=>{}),
-                  fs.unlink(keyPath).catch(()=>{}),
-                  fs.unlink(passPath).catch(()=>{})
-              ]);
+              await Promise.all([ fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}), fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{}) ]);
           }
       };
   } catch (err) {
       console.error('[LOGIN-ERRO-SSL]', err.message);
-      await Promise.all([
-          fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}),
-          fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{})
-      ]);
+      await Promise.all([ fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}), fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{}) ]);
       throw new Error(`Falha ao converter certificado. Senha incorreta ou arquivo corrompido.`);
   }
 }
 
-// ======================================================
-// MOTOR mTLS NATIVO VIA CURL (BYPASS DO SERVIDOR SERPRO)
-// ======================================================
 async function executeMtlsHandshake(url, certPemPath, keyPemPath, playwrightCookies) {
-  console.log(`[LOGIN] Disparando Handshake mTLS via cURL para: ${url.substring(0, 70)}...`);
+  console.log(`[LOGIN] Disparando Handshake mTLS via cURL para Gov.br...`);
   return new Promise((resolve, reject) => {
     try {
-      const validCookies = playwrightCookies.filter(c => 
-        c.name.includes('JSESSIONID') || 
-        c.name.includes('govbr') || 
-        c.name.includes('TS01') ||
-        c.name.includes('WAF')
-      );
-      const cookieStr = validCookies.map(c => `${c.name}=${c.value}`).join('; ');
+      // Usamos todos os cookies agora, nada de filtrar
+      const cookieStr = playwrightCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-      const curlCmd = `curl -s -i -L --max-redirs 0 \
+      const curlCmd = `curl -s -i -k -L --max-redirs 0 \
         --cert "${certPemPath}" --key "${keyPemPath}" \
         -H "Cookie: ${cookieStr}" \
         -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
@@ -152,6 +131,9 @@ async function executeMtlsHandshake(url, certPemPath, keyPemPath, playwrightCook
       const statusLine = lines[0] || '';
       
       console.log(`[LOGIN] Resposta mTLS cURL - Status Line: ${statusLine}`);
+
+      const bodyIndex = output.indexOf('\r\n\r\n');
+      const body = bodyIndex > -1 ? output.substring(bodyIndex + 4) : output;
 
       if (statusLine.includes('302') || statusLine.includes('303') || statusLine.includes('301')) {
           let location = '';
@@ -166,9 +148,8 @@ async function executeMtlsHandshake(url, certPemPath, keyPemPath, playwrightCook
           }
       } 
       
-      const bodyIndex = output.indexOf('\r\n\r\n');
-      const body = bodyIndex > -1 ? output.substring(bodyIndex) : output;
-
+      console.log('[DEBUG GOV] O Gov.br retornou HTML de Erro:', body.substring(0, 300).replace(/\n/g, ' '));
+      
       if (body.includes('acesso.gov.br/info/x509') || body.includes('Revogado')) {
          const e = new Error('Certificado Rejeitado/Revogado pelo Gov.br.');
          e.pfxStage = 'PFX_INVALID';
@@ -182,15 +163,9 @@ async function executeMtlsHandshake(url, certPemPath, keyPemPath, playwrightCook
   });
 }
 
-// ======================================================
-// ESTRATÉGIA HÍBRIDA
-// ======================================================
 async function loginGovBr(pfxBase64, password) {
   console.log('[LOGIN] Iniciando motor híbrido (WAF Bypass)...');
-  
-  let browser;
-  let page; 
-  let cleanupFiles = null;
+  let browser; let page; let cleanupFiles = null;
 
   try {
     browser = await chromium.launchPersistentContext('', {
@@ -218,11 +193,9 @@ async function loginGovBr(pfxBase64, password) {
     const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${cId}&authorization_id=${authId}`;
     const pwCookies = await browser.cookies();
     
-    // Geração dos arquivos PEM
     const certData = await convertPfxToPem(pfxBase64, password);
     cleanupFiles = certData.cleanup;
     
-    // Dispara o cURL
     const mtlsResult = await executeMtlsHandshake(certUrl, certData.certPath, certData.keyPath, pwCookies);
     
     if (mtlsResult.setCookies && mtlsResult.setCookies.length > 0) {
@@ -285,46 +258,33 @@ async function loginGovBr(pfxBase64, password) {
   }
 }
 
-// ======================================================
-// ROTAS E SERVIDOR API
-// ======================================================
 app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
   const { cnpj, pfxBase64, password, payloadBusca } = req.body
   if (!cnpj) return res.status(400).json({ success: false, erro: 'CNPJ obrigatório' })
-
   try {
     const { jar, headersApiFgts } = await loginGovBr(pfxBase64, password)
     const cnpjNum = cnpj.replace(/\D/g,'')
     const empId = `${cnpjNum.substring(0,8)}1`
-    
     console.log(`[FGTS-RPA] Consultando guias para o Empregador ${empId}...`)
-
     const respUsuario = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/usuario', { method:'GET', jar, headers: headersApiFgts })
     const dadosUsuario = tryParseJson(respUsuario.body)
-
     let competencias = null;
     const respComp = await httpRequest(`https://fgtsdigital.sistema.gov.br/consignado/api/empregadores/${empId}/competencias`, { method:'GET', jar, headers: headersApiFgts })
     if (respComp.status === 200) competencias = tryParseJson(respComp.body)
-
     const bodyGuias = payloadBusca || {}
     const respLista = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/consultar-guias/guias', { method:'POST', jar, headers: headersApiFgts, body: JSON.stringify(bodyGuias) })
     const listaGuias = tryParseJson(respLista.body)
     const guiasArray = Array.isArray(listaGuias) ? listaGuias : (listaGuias?.content || listaGuias?.itens || [])
-
     const detalhes = []
     for (const g of guiasArray.slice(0, 5)) {
       const idGuia = g.id || g.idGuia || g.numeroGuia
       if (!idGuia) continue
-      
       const respTot = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/totalizador`, { method:'GET', jar, headers: headersApiFgts })
       const respDeb = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/debitos?num-pagina=1&tam-pagina=100&campo-ordem=competenciaApuracao&ordem=desc`, { method:'GET', jar, headers: headersApiFgts })
       const respConsig = await httpRequest(`https://fgtsdigital.sistema.gov.br/cobranca/api/guia/${idGuia}/consignados?num-pagina=1&tam-pagina=100&campo-ordem=competenciaApuracao&ordem=desc`, { method:'GET', jar, headers: headersApiFgts })
-
       detalhes.push({ guiaBase: g, totalizador: tryParseJson(respTot.body), debitos: tryParseJson(respDeb.body), consignados: tryParseJson(respConsig.body) })
     }
-
     res.json({ success: true, usuario: dadosUsuario, competencias: competencias, guias: detalhes })
-
   } catch(e) {
     const c = classifyError(e, 'FGTS')
     res.status(200).json({ success: false, certError: e.pfxStage === 'PFX_INVALID', errorType: c.errorType, stage: c.stage, error: c.message })
@@ -334,14 +294,11 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
 app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
   const { cnpj, pfxBase64, password } = req.body
   if (!cnpj) return res.status(400).json({ success: false, erro: 'CNPJ obrigatório' })
-
   try {
     const { jar, headersApiFgts } = await loginGovBr(pfxBase64, password)
     console.log(`[FGTS-RPA] Extraindo Vínculos para o CNPJ ${cnpj}...`)
-
     const statuses = ['ativo', 'afastado', 'desligado']
     const todosEmpregados = []
-    
     for (const st of statuses) {
         const urlVinculos = `https://fgtsdigital.sistema.gov.br/extrato/api/vinculos/${st}/,,,,0,0?num-pagina=1&tam-pagina=1000&campo-ordem=nmTrabalhador&ordem=asc`
         const resp = await httpRequest(urlVinculos, { method: 'GET', jar, headers: headersApiFgts })
@@ -352,7 +309,6 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
         }
     }
     res.json({ success: true, total: todosEmpregados.length, empregados: todosEmpregados })
-
   } catch(e) {
     const c = classifyError(e, 'FGTS')
     res.status(200).json({ success: false, certError: e.pfxStage === 'PFX_INVALID', errorType: c.errorType, stage: c.stage, error: c.message })
