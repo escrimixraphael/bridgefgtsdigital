@@ -2,7 +2,7 @@
 FROM node:22-bookworm
 
 # Atualiza o sistema e instala o OpenSSL
-RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl
 
 # Cria e define a pasta de trabalho dentro do container
 WORKDIR /app
