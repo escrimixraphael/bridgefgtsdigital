@@ -2,14 +2,12 @@ import express from 'express'
 import cors from 'cors'
 import crypto from 'node:crypto'
 import dns from 'node:dns'
-import https from 'node:https'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { execSync } from 'node:child_process'
 import { chromium } from 'playwright'
 
-// Resolve DNS de IPv6 do Cloud Run
 dns.setDefaultResultOrder('ipv4first'); 
 
 const app = express()
@@ -80,7 +78,7 @@ async function httpRequest(url, options) {
 }
 
 // ======================================================
-// EXTRAÇÃO DE PEM VIA OPENSSL (BYPASS NO NODE 18/20 PFX)
+// EXTRAÇÃO DE PEM VIA OPENSSL (RETORNA CAMINHOS DOS ARQUIVOS)
 // ======================================================
 async function convertPfxToPem(pfxBase64, password) {
   const buf = Buffer.from(pfxBase64, 'base64');
@@ -97,104 +95,90 @@ async function convertPfxToPem(pfxBase64, password) {
   try {
       console.log('[LOGIN] Convertendo PFX legado para PEM via OpenSSL...');
       try {
-          // 1. Tenta forçar os providers legacy do OpenSSL 3.0+ (Ubuntu 22/Debian 12)
-          // Isso resolve o erro "error:0308010C:digital envelope routines::unsupported" (RC2-40-CBC)
           execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
           execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
       } catch (err) {
-          // 2. Se falhar, tenta o comando padrão (OpenSSL 1.1 antigo ou versões sem suporte explícito a providers via CLI)
           execSync(`openssl pkcs12 -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`);
           execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`);
       }
-      
-      const cert = await fs.readFile(certPath, 'utf8');
-      const key = await fs.readFile(keyPath, 'utf8');
-      
-      return { cert, key };
+      // Retorna os caminhos para o CURL usar, e uma função para limpar tudo no final
+      return { 
+          certPath, 
+          keyPath, 
+          cleanup: async () => {
+              await Promise.all([
+                  fs.unlink(inPath).catch(()=>{}),
+                  fs.unlink(certPath).catch(()=>{}),
+                  fs.unlink(keyPath).catch(()=>{}),
+                  fs.unlink(passPath).catch(()=>{})
+              ]);
+          }
+      };
   } catch (err) {
       console.error('[LOGIN-ERRO-SSL]', err.message);
-      throw new Error(`Falha ao converter certificado: A senha está incorreta, o arquivo está corrompido, ou falha de criptografia RC2-40-CBC.`);
-  } finally {
-      // Limpeza de arquivos sensíveis
       await Promise.all([
-          fs.unlink(inPath).catch(()=>{}),
-          fs.unlink(certPath).catch(()=>{}),
-          fs.unlink(keyPath).catch(()=>{}),
-          fs.unlink(passPath).catch(()=>{})
+          fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}),
+          fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{})
       ]);
+      throw new Error(`Falha ao converter certificado. Senha incorreta ou arquivo corrompido.`);
   }
 }
 
 // ======================================================
-// MOTOR mTLS NATIVO DO NODE.JS (COM CERTIFICADO PURO)
+// MOTOR mTLS NATIVO VIA CURL (BYPASS DO SERVIDOR SERPRO)
 // ======================================================
-async function executeMtlsHandshake(url, certPem, keyPem, playwrightCookies) {
-  console.log(`[LOGIN] Disparando Handshake mTLS Nativo para: ${url.substring(0, 70)}...`);
+async function executeMtlsHandshake(url, certPemPath, keyPemPath, playwrightCookies) {
+  console.log(`[LOGIN] Disparando Handshake mTLS via cURL para: ${url.substring(0, 70)}...`);
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    
-    // AJUSTE CRÍTICO: Filtrar apenas os cookies vitais e formatá-los para evitar bloqueio WAF
-    const validCookies = playwrightCookies.filter(c => 
-      c.name.includes('JSESSIONID') || 
-      c.name.includes('govbr') || 
-      c.name.includes('TS01') ||
-      c.name.includes('WAF')
-    );
-    const cookieStr = validCookies.map(c => `${c.name}=${c.value}`).join('; ');
+    try {
+      const validCookies = playwrightCookies.filter(c => 
+        c.name.includes('JSESSIONID') || 
+        c.name.includes('govbr') || 
+        c.name.includes('TS01') ||
+        c.name.includes('WAF')
+      );
+      const cookieStr = validCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    const options = {
-      hostname: u.hostname,
-      port: 443,
-      path: u.pathname + u.search,
-      method: 'GET',
-      cert: certPem, 
-      key: keyPem,   
-      rejectUnauthorized: false, // Ignorar CA não confiável (O governo usa cadeias ICP-Brasil)
-      servername: u.hostname,    // Obriga o envio do SNI (Obrigatório no Serpro)
-      minVersion: 'TLSv1.2',     // Compatibilidade garantida com HAProxy do Serpro
-      maxVersion: 'TLSv1.2',
-      ciphers: 'DEFAULT:@SECLEVEL=0', // Desativa trava severa do TLS
-      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
-      headers: {
-        'Host': u.hostname,      // O Serpro corta se o Host Header não for explícito
-        'Cookie': cookieStr,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Referer': 'https://sso.acesso.gov.br/'
+      const curlCmd = `curl -s -i -L --max-redirs 0 \
+        --cert "${certPemPath}" --key "${keyPemPath}" \
+        -H "Cookie: ${cookieStr}" \
+        -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+        -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+        -H "Referer: https://sso.acesso.gov.br/" \
+        "${url}"`;
+
+      const output = execSync(curlCmd).toString();
+      const lines = output.split('\r\n');
+      const statusLine = lines[0] || '';
+      
+      console.log(`[LOGIN] Resposta mTLS cURL - Status Line: ${statusLine}`);
+
+      if (statusLine.includes('302') || statusLine.includes('303') || statusLine.includes('301')) {
+          let location = '';
+          const setCookies = [];
+          for (const line of lines) {
+              if (line.toLowerCase().startsWith('location:')) location = line.substring(9).trim();
+              if (line.toLowerCase().startsWith('set-cookie:')) setCookies.push(line.substring(11).trim());
+          }
+          if (location) {
+             resolve({ success: true, location, setCookies });
+             return;
+          }
+      } 
+      
+      const bodyIndex = output.indexOf('\r\n\r\n');
+      const body = bodyIndex > -1 ? output.substring(bodyIndex) : output;
+
+      if (body.includes('acesso.gov.br/info/x509') || body.includes('Revogado')) {
+         const e = new Error('Certificado Rejeitado/Revogado pelo Gov.br.');
+         e.pfxStage = 'PFX_INVALID';
+         reject(e);
+      } else {
+         reject(new Error(`Falha no mTLS via cURL. Status: ${statusLine}.`));
       }
-    };
-
-    const req = https.request(options, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        console.log(`[LOGIN] Resposta mTLS Nativa - Status: ${res.statusCode}`);
-        const location = res.headers.location;
-        const setCookies = res.headers['set-cookie'] || [];
-        
-        // Sucesso total - o governo redirecionou com a sessão logada!
-        if (res.statusCode >= 300 && res.statusCode < 400 && location) {
-           resolve({ success: true, location, setCookies });
-        } else {
-           if (res.statusCode === 200) {
-               console.log('[DEBUG GOV] O Gov.br retornou HTML 200. Trecho:', body.substring(0, 150).replace(/\n/g, ' '));
-           }
-
-           if (body.includes('acesso.gov.br/info/x509') || body.includes('Revogado')) {
-               const e = new Error('Certificado Rejeitado/Revogado pelo Gov.br.');
-               e.pfxStage = 'PFX_INVALID';
-               reject(e);
-           } else {
-               reject(new Error(`Falha no mTLS nativo. Status: ${res.statusCode}.`));
-           }
-        }
-      });
-    });
-    
-    req.on('error', (err) => reject(new Error(`Falha de rede no mTLS: ${err.message}`)));
-    req.end();
+    } catch (err) {
+      reject(new Error(`Falha de sistema no cURL mTLS: ${err.message}`));
+    }
   });
 }
 
@@ -206,18 +190,13 @@ async function loginGovBr(pfxBase64, password) {
   
   let browser;
   let page; 
+  let cleanupFiles = null;
 
   try {
     browser = await chromium.launchPersistentContext('', {
       headless: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      args: [
-        '--no-sandbox', 
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', 
-        '--disable-gpu',
-        '--disable-blink-features=AutomationControlled'
-      ], 
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-blink-features=AutomationControlled'], 
       ignoreHTTPSErrors: true
     });
     
@@ -226,27 +205,25 @@ async function loginGovBr(pfxBase64, password) {
     console.log('[LOGIN] Passo 1: Acessando Autorização Gov.br para gerar sessão...');
     const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${crypto.randomUUID()}&state=${crypto.randomUUID()}`;
 
-        await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    // Aumentamos o tempo de tolerância para o Gov.br redirecionar de 15s para 30s
+    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForURL(/authorization_id=/, { timeout: 30000 }).catch(() => {});
     
     const authUrlAtual = new URL(page.url());
     const authId = authUrlAtual.searchParams.get('authorization_id');
     const cId = authUrlAtual.searchParams.get('client_id');
 
-    if (!authId || !cId) {
-        // Se falhar, captura a tela para vermos se tem algum bloqueio/captcha
-        const htmlDebug = await page.content();
-        console.log('[DEBUG GOV] Tela presa no passo 1. HTML retornado:', htmlDebug.substring(0, 300).replace(/\n/g, ' '));
-        throw new Error(`Não capturou authorization_id do SSO. URL: ${page.url()}`);
-    }
-    console.log(`[LOGIN] Passo 2: Sessão capturada! Pausando navegador e assumindo Node.js...`);
+    if (!authId || !cId) throw new Error(`Não capturou authorization_id do SSO. URL: ${page.url()}`);
+
+    console.log(`[LOGIN] Passo 2: Sessão capturada! Pausando navegador e assumindo Node.js (cURL)...`);
     const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${cId}&authorization_id=${authId}`;
     const pwCookies = await browser.cookies();
     
-    // NOVIDADE AQUI: Usa a função OpenSSL para quebrar o PFX em PEM (livrando o Node 18 do erro)
-    const { cert, key } = await convertPfxToPem(pfxBase64, password);
-    const mtlsResult = await executeMtlsHandshake(certUrl, cert, key, pwCookies);
+    // Geração dos arquivos PEM
+    const certData = await convertPfxToPem(pfxBase64, password);
+    cleanupFiles = certData.cleanup;
+    
+    // Dispara o cURL
+    const mtlsResult = await executeMtlsHandshake(certUrl, certData.certPath, certData.keyPath, pwCookies);
     
     if (mtlsResult.setCookies && mtlsResult.setCookies.length > 0) {
         const cookiesToInject = mtlsResult.setCookies.map(cookieStr => {
@@ -257,7 +234,7 @@ async function loginGovBr(pfxBase64, password) {
         await browser.addCookies(cookiesToInject);
     }
 
-    console.log(`[LOGIN] Passo 3: Sucesso! Devolvendo fluxo ao Playwright na rota de autorização.`);
+    console.log(`[LOGIN] Passo 3: Sucesso mTLS! Devolvendo fluxo ao Playwright na rota de autorização.`);
     await page.goto(mtlsResult.location, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     console.log('[LOGIN] Passo 4: Aguardando o redirect final da aplicação FGTS Digital...');
@@ -267,7 +244,7 @@ async function loginGovBr(pfxBase64, password) {
     }, { timeout: 45000 });
 
     if (page.url().includes('acesso.gov.br/info/x509/')) {
-        const e = new Error(`Certificado inválido ou revogado pelo Governo. URL: ${page.url()}`);
+        const e = new Error(`Certificado inválido ou revogado pelo Governo.`);
         e.pfxStage = 'PFX_INVALID';
         throw e;
     }
@@ -280,6 +257,7 @@ async function loginGovBr(pfxBase64, password) {
     jar.set(finalCookies.map(c => `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}`));
 
     await browser.close();
+    if (cleanupFiles) await cleanupFiles();
     
     console.log('[LOGIN] Trocando o Código pelo Token JWT...');
     const fgtsUrlObj = new URL(urlFgtsCode);
@@ -302,6 +280,7 @@ async function loginGovBr(pfxBase64, password) {
   } catch (error) {
     console.error('[LOGIN-ERRO]', error.message);
     if (browser) await browser.close().catch(() => {});
+    if (cleanupFiles) await cleanupFiles().catch(() => {});
     throw error;
   }
 }
