@@ -2,6 +2,10 @@ import express from 'express'
 import cors from 'cors'
 import crypto from 'node:crypto'
 import dns from 'node:dns'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { execSync } from 'node:child_process'
 import { chromium } from 'playwright'
 
 dns.setDefaultResultOrder('ipv4first'); 
@@ -73,26 +77,61 @@ async function httpRequest(url, options) {
   return { status: response.status, headers: response.headers, body: text };
 }
 
+async function convertPfxToPem(pfxBase64, password) {
+  const buf = Buffer.from(pfxBase64, 'base64');
+  const tmpDir = os.tmpdir();
+  const uuid = crypto.randomUUID();
+  const inPath = path.join(tmpDir, `in_${uuid}.pfx`);
+  const certPath = path.join(tmpDir, `cert_${uuid}.pem`);
+  const keyPath = path.join(tmpDir, `key_${uuid}.pem`);
+  const passPath = path.join(tmpDir, `pass_${uuid}.txt`);
+  
+  await fs.writeFile(inPath, buf);
+  await fs.writeFile(passPath, password);
+  
+  try {
+      console.log('[LOGIN] Destravando PFX legado e extraindo chaves modernizadas...');
+      try {
+          execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -nokeys -out "${certPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
+          execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
+      } catch (err) {
+          execSync(`openssl pkcs12 -in "${inPath}" -nokeys -out "${certPath}" -passin file:"${passPath}"`);
+          execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`);
+      }
+      return { 
+          certPath, keyPath, 
+          cleanup: async () => {
+              await Promise.all([ fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}), fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{}) ]);
+          }
+      };
+  } catch (err) {
+      console.error('[LOGIN-ERRO-SSL]', err.message);
+      await Promise.all([ fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}), fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{}) ]);
+      throw new Error(`Falha ao converter certificado. Senha incorreta ou arquivo corrompido.`);
+  }
+}
+
 async function loginGovBr(pfxBase64, password) {
-  console.log('[LOGIN] Iniciando motor Playwright com suporte NATIVO a mTLS...');
-  let browser; let context;
+  console.log('[LOGIN] Iniciando motor Playwright com bypass de OpenSSL Legacy...');
+  let browser; let context; let cleanupFiles = null;
 
   try {
-    const pfxBuffer = Buffer.from(pfxBase64, 'base64');
+    const certData = await convertPfxToPem(pfxBase64, password);
+    cleanupFiles = certData.cleanup;
     
     browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-blink-features=AutomationControlled']
     });
     
-    // O SEGREDO ESTÁ AQUI: O navegador já nasce com o certificado instalado na memória!
+    // Agora alimentamos os arquivos PEM extraídos e decriptados (cert e key)
     context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
       clientCertificates: [{
         origin: 'https://certificado.sso.acesso.gov.br',
-        pfx: pfxBuffer,
-        passphrase: password
+        certPath: certData.certPath,
+        keyPath: certData.keyPath
       }]
     });
     
@@ -110,7 +149,7 @@ async function loginGovBr(pfxBase64, password) {
 
     if (!authId || !cId) throw new Error(`Não capturou authorization_id do SSO. URL: ${page.url()}`);
 
-    console.log(`[LOGIN] Passo 2: Navegando para o Endpoint de Certificado Digital...`);
+    console.log(`[LOGIN] Passo 2: Navegando para o Endpoint de Certificado Digital mTLS...`);
     const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${cId}&authorization_id=${authId}`;
     
     await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -135,6 +174,7 @@ async function loginGovBr(pfxBase64, password) {
     jar.set(finalCookies.map(c => `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}`));
 
     await browser.close();
+    if (cleanupFiles) await cleanupFiles();
     
     console.log('[LOGIN] Trocando o Código pelo Token JWT...');
     const fgtsUrlObj = new URL(urlFgtsCode);
@@ -157,6 +197,7 @@ async function loginGovBr(pfxBase64, password) {
   } catch (error) {
     console.error('[LOGIN-ERRO]', error.message);
     if (browser) await browser.close().catch(() => {});
+    if (cleanupFiles) await cleanupFiles().catch(() => {});
     throw error;
   }
 }
