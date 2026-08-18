@@ -38,7 +38,7 @@ function requireApiKey(req, res, next) {
 function classifyError(err, stage) {
   const code = err?.code || ''
   const msg = err?.message || String(err)
-  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão com o Governo.' }
+  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão com o Governo ou Captcha não resolvido a tempo.' }
   return { errorType: 'BRIDGE_INTERNAL', stage, code: code || 'UNKNOWN', message: msg }
 }
 
@@ -112,7 +112,7 @@ async function convertPfxToPem(pfxBase64, password) {
 }
 
 async function loginGovBr(pfxBase64, password) {
-  console.log('[LOGIN] Iniciando motor Playwright com bypass de OpenSSL Legacy...');
+  console.log('[LOGIN] Iniciando motor Playwright com UI ativada (para Captcha) e auto-injeção de mTLS...');
   let browser; let context; let cleanupFiles = null;
 
   try {
@@ -120,11 +120,12 @@ async function loginGovBr(pfxBase64, password) {
     cleanupFiles = certData.cleanup;
     
     browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-blink-features=AutomationControlled']
+      headless: false, // OBRIGATÓRIO SER FALSE para resolver hCaptcha manualmente
+      channel: 'chrome', // Usa a instalação nativa do Google Chrome
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
     });
     
-    // Agora alimentamos os arquivos PEM extraídos e decriptados (cert e key)
+    // Injeta os certificados PEM no contexto, evitando o popup de seleção de certificado do Windows/Chrome
     context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
@@ -137,28 +138,20 @@ async function loginGovBr(pfxBase64, password) {
     
     const page = await context.newPage();
 
-    console.log('[LOGIN] Passo 1: Acessando Autorização Gov.br para gerar sessão...');
-    const authUrl = `https://sso.acesso.gov.br/authorize?response_type=code&client_id=por-p-fgtsd.estaleiro.serpro.gov.br&scope=openid+email+phone+profile+govbr_empresa+govbr_confiabilidades&redirect_uri=https%3A%2F%2Ffgtsdigital.sistema.gov.br%2Fportal%2Facessogov&nonce=${crypto.randomUUID()}&state=${crypto.randomUUID()}`;
+    console.log('[LOGIN] Passo 1: Acessando portal do FGTS Digital...');
+    await page.goto('https://fgtsdigital.sistema.gov.br/portal/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForURL(/authorization_id=/, { timeout: 30000 }).catch(() => {});
-    
-    const authUrlAtual = new URL(page.url());
-    const authId = authUrlAtual.searchParams.get('authorization_id');
-    const cId = authUrlAtual.searchParams.get('client_id');
+    console.log('[LOGIN] Passo 2: Aguardando botão de Certificado Digital...');
+    const btnCert = page.locator('#login-certificate');
+    await btnCert.waitFor({ state: 'visible', timeout: 30000 });
 
-    if (!authId || !cId) throw new Error(`Não capturou authorization_id do SSO. URL: ${page.url()}`);
+    console.log('[LOGIN] Passo 3: Clicando em "Seu certificado digital"...');
+    console.log('⚠️ ATENÇÃO: Se o hCaptcha aparecer, resolva-o manualmente na janela do Chrome.');
+    await btnCert.click();
 
-    console.log(`[LOGIN] Passo 2: Navegando para o Endpoint de Certificado Digital mTLS...`);
-    const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=${cId}&authorization_id=${authId}`;
-    
-    await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    console.log('[LOGIN] Passo 3: Aguardando o redirect final da aplicação FGTS Digital...');
-    await page.waitForURL(url => {
-        const href = url.href;
-        return href.includes('fgtsdigital.sistema.gov.br/portal/acessogov?code=') || href.includes('acesso.gov.br/info/x509/');
-    }, { timeout: 45000 });
+    console.log('[LOGIN] Passo 4: Aguardando autenticação e redirecionamento...');
+    // Aguarda até 2 minutos para dar tempo ao humano resolver o Captcha (se aparecer)
+    await page.waitForURL(/fgtsdigital\.sistema\.gov\.br\/portal/, { timeout: 120000 });
 
     if (page.url().includes('acesso.gov.br/info/x509/')) {
         const e = new Error(`Certificado inválido ou revogado pelo Governo.`);
@@ -166,8 +159,20 @@ async function loginGovBr(pfxBase64, password) {
         throw e;
     }
     
-    const urlFgtsCode = page.url();
-    console.log('[LOGIN] SUCESSO EXTREMO! Código de acesso obtido via mTLS Nativo!');
+    console.log('[LOGIN] Redirecionamento concluído. Extraindo Token JWT (fgtsd_login)...');
+    
+    // Aguarda o JS da própria página do FGTS finalizar a troca de Code por Token JWT
+    let fgtsdLoginCookie = null;
+    for (let i = 0; i < 20; i++) { // Tenta por 10 segundos
+        const cookies = await context.cookies();
+        fgtsdLoginCookie = cookies.find(c => c.name === 'fgtsd_login');
+        if (fgtsdLoginCookie) break;
+        await page.waitForTimeout(500);
+    }
+
+    if (!fgtsdLoginCookie) throw new Error('Falha ao obter o cookie fgtsd_login do navegador.');
+
+    console.log('[LOGIN] SUCESSO EXTREMO! Sessão capturada com sucesso!');
 
     const finalCookies = await context.cookies();
     const jar = newCookieJar();
@@ -176,23 +181,15 @@ async function loginGovBr(pfxBase64, password) {
     await browser.close();
     if (cleanupFiles) await cleanupFiles();
     
-    console.log('[LOGIN] Trocando o Código pelo Token JWT...');
-    const fgtsUrlObj = new URL(urlFgtsCode);
     const headersApiFgts = {
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': urlFgtsCode,
+        'Referer': page.url(),
         'Origin': 'https://fgtsdigital.sistema.gov.br'
     };
 
-    const payloadToken = JSON.stringify({ code: fgtsUrlObj.searchParams.get('code'), state: fgtsUrlObj.searchParams.get('state') });
-    await httpRequest('https://fgtsdigital.sistema.gov.br/portal/api/v1/acessogov/token', { method: 'POST', jar, headers: headersApiFgts, body: payloadToken });
-    
-    await httpRequest('https://fgtsdigital.sistema.gov.br/portal/escolhaPerfil', { method: 'GET', jar, headers: headersApiFgts });
-    await httpRequest('https://fgtsdigital.sistema.gov.br/portal/empregador/v1/empregadores/primeiroacesso', { method: 'GET', jar, headers: headersApiFgts });
-
-    return { jar, finalUrl: urlFgtsCode, headersApiFgts };
+    return { jar, headersApiFgts };
 
   } catch (error) {
     console.error('[LOGIN-ERRO]', error.message);
@@ -210,15 +207,19 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
     const cnpjNum = cnpj.replace(/\D/g,'')
     const empId = `${cnpjNum.substring(0,8)}1`
     console.log(`[FGTS-RPA] Consultando guias para o Empregador ${empId}...`)
+    
     const respUsuario = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/usuario', { method:'GET', jar, headers: headersApiFgts })
     const dadosUsuario = tryParseJson(respUsuario.body)
+    
     let competencias = null;
     const respComp = await httpRequest(`https://fgtsdigital.sistema.gov.br/consignado/api/empregadores/${empId}/competencias`, { method:'GET', jar, headers: headersApiFgts })
     if (respComp.status === 200) competencias = tryParseJson(respComp.body)
+    
     const bodyGuias = payloadBusca || {}
     const respLista = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/consultar-guias/guias', { method:'POST', jar, headers: headersApiFgts, body: JSON.stringify(bodyGuias) })
     const listaGuias = tryParseJson(respLista.body)
     const guiasArray = Array.isArray(listaGuias) ? listaGuias : (listaGuias?.content || listaGuias?.itens || [])
+    
     const detalhes = []
     for (const g of guiasArray.slice(0, 5)) {
       const idGuia = g.id || g.idGuia || g.numeroGuia
@@ -243,6 +244,7 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
     console.log(`[FGTS-RPA] Extraindo Vínculos para o CNPJ ${cnpj}...`)
     const statuses = ['ativo', 'afastado', 'desligado']
     const todosEmpregados = []
+    
     for (const st of statuses) {
         const urlVinculos = `https://fgtsdigital.sistema.gov.br/extrato/api/vinculos/${st}/,,,,0,0?num-pagina=1&tam-pagina=1000&campo-ordem=nmTrabalhador&ordem=asc`
         const resp = await httpRequest(urlVinculos, { method: 'GET', jar, headers: headersApiFgts })
@@ -260,4 +262,4 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }))
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Bridge FGTS Digital RPA rodando na porta ${PORT} (0.0.0.0)`))
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Bridge FGTS Digital RPA rodando na
