@@ -97,13 +97,14 @@ async function convertPfxToPem(pfxBase64, password) {
   try {
       console.log('[LOGIN] Convertendo PFX legado para PEM via OpenSSL...');
       try {
-          // Tenta a extração padrão do OpenSSL
+          // 1. Tenta forçar os providers legacy do OpenSSL 3.0+ (Ubuntu 22/Debian 12)
+          // Isso resolve o erro "error:0308010C:digital envelope routines::unsupported" (RC2-40-CBC)
+          execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
+          execSync(`openssl pkcs12 -legacy -provider default -provider legacy -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`, { stdio: 'pipe' });
+      } catch (err) {
+          // 2. Se falhar, tenta o comando padrão (OpenSSL 1.1 antigo ou versões sem suporte explícito a providers via CLI)
           execSync(`openssl pkcs12 -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`);
           execSync(`openssl pkcs12 -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`);
-      } catch (err) {
-          // Fallback para OpenSSL 3+ com a flag -legacy
-          execSync(`openssl pkcs12 -legacy -in "${inPath}" -clcerts -nokeys -out "${certPath}" -passin file:"${passPath}"`);
-          execSync(`openssl pkcs12 -legacy -in "${inPath}" -nocerts -nodes -out "${keyPath}" -passin file:"${passPath}"`);
       }
       
       const cert = await fs.readFile(certPath, 'utf8');
@@ -111,7 +112,8 @@ async function convertPfxToPem(pfxBase64, password) {
       
       return { cert, key };
   } catch (err) {
-      throw new Error(`Falha ao converter certificado: A senha está incorreta ou o arquivo está corrompido.`);
+      console.error('[LOGIN-ERRO-SSL]', err.message);
+      throw new Error(`Falha ao converter certificado: A senha está incorreta, o arquivo está corrompido, ou falha de criptografia RC2-40-CBC.`);
   } finally {
       // Limpeza de arquivos sensíveis
       await Promise.all([
