@@ -1,5 +1,5 @@
 # Usa a imagem oficial do Node 22 com Debian 12 (Bookworm)
-FROM node:22-bookworm
+FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
 # Atualiza o sistema e instala o OpenSSL
 RUN apt-get update && apt-get install -y curl
