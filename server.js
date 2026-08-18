@@ -132,7 +132,15 @@ async function executeMtlsHandshake(url, certPem, keyPem, playwrightCookies) {
   console.log(`[LOGIN] Disparando Handshake mTLS Nativo para: ${url.substring(0, 70)}...`);
   return new Promise((resolve, reject) => {
     const u = new URL(url);
-    const cookieStr = playwrightCookies.map(c => `${c.name}=${c.value}`).join('; ');
+    
+    // AJUSTE CRÍTICO: Filtrar apenas os cookies vitais e formatá-los para evitar bloqueio WAF
+    const validCookies = playwrightCookies.filter(c => 
+      c.name.includes('JSESSIONID') || 
+      c.name.includes('govbr') || 
+      c.name.includes('TS01') ||
+      c.name.includes('WAF')
+    );
+    const cookieStr = validCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
     const options = {
       hostname: u.hostname,
@@ -141,16 +149,19 @@ async function executeMtlsHandshake(url, certPem, keyPem, playwrightCookies) {
       method: 'GET',
       cert: certPem, 
       key: keyPem,   
-      rejectUnauthorized: false,
-      servername: u.hostname, // <--- AJUSTE 1: Obriga o envio do nome do servidor (SNI)
-      minVersion: 'TLSv1.2',  // <--- AJUSTE 2: Força o uso do TLS 1.2 (Compatível com o Serpro)
-      maxVersion: 'TLSv1.2',  
-      ciphers: 'DEFAULT:@SECLEVEL=0', // <--- AJUSTE 3: Desativa a trava de segurança severa do Node 22
+      rejectUnauthorized: false, // Ignorar CA não confiável (O governo usa cadeias ICP-Brasil)
+      servername: u.hostname,    // Obriga o envio do SNI (Obrigatório no Serpro)
+      minVersion: 'TLSv1.2',     // Compatibilidade garantida com HAProxy do Serpro
+      maxVersion: 'TLSv1.2',
+      ciphers: 'DEFAULT:@SECLEVEL=0', // Desativa trava severa do TLS
       secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
       headers: {
+        'Host': u.hostname,      // O Serpro corta se o Host Header não for explícito
         'Cookie': cookieStr,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
         'Referer': 'https://sso.acesso.gov.br/'
       }
     };
@@ -163,12 +174,12 @@ async function executeMtlsHandshake(url, certPem, keyPem, playwrightCookies) {
         const location = res.headers.location;
         const setCookies = res.headers['set-cookie'] || [];
         
+        // Sucesso total - o governo redirecionou com a sessão logada!
         if (res.statusCode >= 300 && res.statusCode < 400 && location) {
            resolve({ success: true, location, setCookies });
         } else {
-           // Debug extra para vermos o que o governo respondeu
            if (res.statusCode === 200) {
-               console.log('[DEBUG GOV] O governo ignorou o certificado. HTML retornado:', body.substring(0, 150).replace(/\n/g, ' '));
+               console.log('[DEBUG GOV] O Gov.br retornou HTML 200. Trecho:', body.substring(0, 150).replace(/\n/g, ' '));
            }
 
            if (body.includes('acesso.gov.br/info/x509') || body.includes('Revogado')) {
