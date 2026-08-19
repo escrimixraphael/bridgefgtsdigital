@@ -162,24 +162,16 @@ async function loginGovBr(pfxBase64, password, cnpjDesejado, isProcurador) {
         ? path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
         : '/home/ubuntu/.config/google-chrome';
     
-    // Caminho do Chrome Oficial adaptado
-    let chromePath = '/usr/bin/google-chrome';
-    if (isWindows) {
-        const path1 = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-        const path2 = 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe';
-        try { await fs.access(path1); chromePath = path1; } 
-        catch { chromePath = path2; }
-    }
-    
     try {
       context = await chromium.launchPersistentContext(userDataDir, {
-        headless: false, // Abre visível para você ver
-        executablePath: chromePath, 
-        viewport: null, // Usa o tamanho real da sua tela
-        ignoreDefaultArgs: ['--enable-automation'], // ESCONDE O AVISO DE "SOFTWARE AUTOMATIZADO" NO TOPO!
+        headless: false, 
+        channel: 'chrome', // ISSO AQUI FORÇA USAR O CHROME OFICIAL DO SEU COMPUTADOR
+        viewport: null, 
+        ignoreDefaultArgs: ['--enable-automation'], // ESCONDE O AVISO DE AUTOMAÇÃO
         args: [
-          '--start-maximized', // Abre o Chrome em tela cheia como você faria normalmente
-          '--restore-last-session'
+          '--start-maximized', 
+          '--profile-directory=Default', // ISSO AQUI FORÇA USAR A SUA CONTA GOOGLE PRINCIPAL
+          '--disable-blink-features=AutomationControlled'
         ],
         clientCertificates: [{
           origin: 'https://sso.acesso.gov.br', 
@@ -194,7 +186,8 @@ async function loginGovBr(pfxBase64, password, cnpjDesejado, isProcurador) {
     } catch (launchErr) {
       if (launchErr.message.includes('lock') || launchErr.message.includes('EBUSY')) {
           console.error('\n🔴 ATENÇÃO: ERRO DE PERFIL TRANCADO!');
-          console.error('Como estamos usando o seu perfil oficial com a sua conta Google, você precisa FECHAR TODAS as janelas do Chrome antes de disparar o robô!\n');
+          console.error('O Google Chrome já está rodando escondido no fundo do seu Windows!');
+          console.error('Para resolver: Abra o terminal e rode: taskkill //F //IM chrome.exe //T\n');
           throw new Error('Feche todas as abas e janelas do Chrome e tente novamente.');
       }
       throw launchErr;
@@ -388,7 +381,6 @@ async function loginGovBr(pfxBase64, password, cnpjDesejado, isProcurador) {
     const headersApiFgts = {
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
-        // Removido o User-Agent fixo aqui também, para ele mandar o mesmo que o seu navegador normal mandaria
         'Referer': urlFgtsCode,
         'Origin': 'https://fgtsdigital.sistema.gov.br'
     };
