@@ -6,7 +6,12 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { execSync } from 'node:child_process'
-import { chromium } from 'playwright'
+
+import { chromium as playwrightBase } from 'playwright'
+import { chromium } from 'playwright-extra'
+import StealthPlugin from 'puppeteer-extra-plugin-stealth'
+
+chromium.use(StealthPlugin())
 
 dns.setDefaultResultOrder('ipv4first'); 
 
@@ -17,6 +22,33 @@ app.use(express.json({ limit: '50mb' }))
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '9c6c38a65f8052500b7d4c2aff0b87fa'
 const FGTS_API_KEY = process.env.FGTS_API_KEY || '5341b41fa01513c5b3e23f6dc35b8e94'
 const PORT = process.env.PORT || 10000 
+
+// ==========================================
+// GERENCIADOR DE CACHE DE SESSÃO
+// ==========================================
+const sessionCache = new Map();
+const CACHE_TTL_MS = 25 * 60 * 1000; 
+
+async function getCachedOrLogin(cnpj, pfxBase64, password, isProcurador) {
+  const now = Date.now();
+  const cached = sessionCache.get(cnpj);
+  
+  if (cached && (now - cached.timestamp < CACHE_TTL_MS)) {
+      console.log(`[CACHE] ⚡ Sessão reaproveitada com sucesso para o CNPJ ${cnpj}! Pulando login...`);
+      return cached.session;
+  }
+
+  console.log(`[CACHE] ⏳ Sem sessão ativa para ${cnpj}. Iniciando login no Gov.br (Procurador: ${isProcurador})...`);
+  const session = await loginGovBr(pfxBase64, password, cnpj, isProcurador);
+  
+  sessionCache.set(cnpj, {
+      session,
+      timestamp: now
+  });
+  
+  return session;
+}
+// ==========================================
 
 function apiKeyValida(recebida) {
   if (!recebida) return false
@@ -38,7 +70,7 @@ function requireApiKey(req, res, next) {
 function classifyError(err, stage) {
   const code = err?.code || ''
   const msg = err?.message || String(err)
-  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão com o Governo ou Captcha não resolvido a tempo.' }
+  if (/^Timeout:/i.test(msg) || code === 'ETIMEDOUT') return { errorType: 'TIMEOUT', stage, code: 'TIMEOUT', message: 'Timeout de conexão com o Governo.' }
   return { errorType: 'BRIDGE_INTERNAL', stage, code: code || 'UNKNOWN', message: msg }
 }
 
@@ -107,103 +139,280 @@ async function convertPfxToPem(pfxBase64, password) {
   } catch (err) {
       console.error('[LOGIN-ERRO-SSL]', err.message);
       await Promise.all([ fs.unlink(inPath).catch(()=>{}), fs.unlink(certPath).catch(()=>{}), fs.unlink(keyPath).catch(()=>{}), fs.unlink(passPath).catch(()=>{}) ]);
-      throw new Error(`Falha ao converter certificado. Senha incorreta ou arquivo corrompido.`);
+      throw new Error(`Falha ao converter certificado. Verifique a senha ou se o OpenSSL está instalado na máquina.`);
   }
 }
 
-async function loginGovBr(pfxBase64, password) {
-  console.log('[LOGIN] Iniciando motor Playwright com UI ativada (para Captcha) e auto-injeção de mTLS...');
-  let browser; let context; let cleanupFiles = null;
+// ==========================================
+// MOTOR DE LOGIN PRINCIPAL
+// ==========================================
+async function loginGovBr(pfxBase64, password, cnpjDesejado, isProcurador) {
+  console.log('[LOGIN] Iniciando motor Playwright ancorado no CHROME REAL...');
+  let context; let cleanupFiles = null;
 
   try {
     const certData = await convertPfxToPem(pfxBase64, password);
     cleanupFiles = certData.cleanup;
     
-    browser = await chromium.launch({
-      headless: false, // OBRIGATÓRIO SER FALSE para resolver hCaptcha manualmente
-      channel: 'chrome', // Usa a instalação nativa do Google Chrome
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
-    });
+    // DETECÇÃO DE SISTEMA OPERACIONAL (Para rodar no Windows ou Linux sem alterar o código)
+    const isWindows = process.platform === 'win32';
     
-    // Injeta os certificados PEM no contexto, evitando o popup de seleção de certificado do Windows/Chrome
-    context = await browser.newContext({
+    // Caminho da pasta de cache adaptada
+    const userDataDir = isWindows 
+        ? path.join(process.cwd(), 'chrome-profile-rpa') 
+        : '/home/ubuntu/chrome-profile-rpa';
+    
+    // Caminho do Chrome Oficial adaptado
+    let chromePath = '/usr/bin/google-chrome'; // Padrão Linux
+    if (isWindows) {
+        const path1 = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+        const path2 = 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe';
+        try { await fs.access(path1); chromePath = path1; } 
+        catch { chromePath = path2; }
+    }
+    
+    context = await chromium.launchPersistentContext(userDataDir, {
+      headless: false, // Mantido falso para você VER o robô rodando localmente
+      executablePath: chromePath, 
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
+      viewport: { width: 1280, height: 720 },
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox', 
+        '--disable-dev-shm-usage', 
+        '--disable-blink-features=AutomationControlled',
+        '--disable-web-security',
+        '--keep-alive-for-test', 
+        '--restore-last-session'
+      ],
       clientCertificates: [{
+        origin: 'https://sso.acesso.gov.br', 
+        certPath: certData.certPath,
+        keyPath: certData.keyPath
+      }, {
         origin: 'https://certificado.sso.acesso.gov.br',
         certPath: certData.certPath,
         keyPath: certData.keyPath
       }]
     });
     
-    const page = await context.newPage();
+    const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+    page.setDefaultTimeout(180000); 
 
-    console.log('[LOGIN] Passo 1: Acessando portal do FGTS Digital...');
-    await page.goto('https://fgtsdigital.sistema.gov.br/portal/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    console.log('[LOGIN] Passo 2: Aguardando botão de Certificado Digital...');
-    const btnCert = page.locator('#login-certificate');
-    await btnCert.waitFor({ state: 'visible', timeout: 30000 });
-
-    console.log('[LOGIN] Passo 3: Clicando em "Seu certificado digital"...');
-    console.log('⚠️ ATENÇÃO: Se o hCaptcha aparecer, resolva-o manualmente na janela do Chrome.');
-    await btnCert.click();
-
-    console.log('[LOGIN] Passo 4: Aguardando autenticação e redirecionamento...');
-    // Aguarda até 2 minutos para dar tempo ao humano resolver o Captcha (se aparecer)
-    await page.waitForURL(/fgtsdigital\.sistema\.gov\.br\/portal/, { timeout: 120000 });
-
-    if (page.url().includes('acesso.gov.br/info/x509/')) {
-        const e = new Error(`Certificado inválido ou revogado pelo Governo.`);
-        e.pfxStage = 'PFX_INVALID';
-        throw e;
-    }
+    console.log('[LOGIN] Passo 1: Acessando a página inicial do FGTS Digital...');
+    await page.goto('https://fgtsdigital.sistema.gov.br/portal/login', { waitUntil: 'domcontentloaded' });
     
-    console.log('[LOGIN] Redirecionamento concluído. Extraindo Token JWT (fgtsd_login)...');
-    
-    // Aguarda o JS da própria página do FGTS finalizar a troca de Code por Token JWT
-    let fgtsdLoginCookie = null;
-    for (let i = 0; i < 20; i++) { // Tenta por 10 segundos
-        const cookies = await context.cookies();
-        fgtsdLoginCookie = cookies.find(c => c.name === 'fgtsd_login');
-        if (fgtsdLoginCookie) break;
-        await page.waitForTimeout(500);
+    console.log('[LOGIN] Aguardando para ver se o sistema redireciona automaticamente (Sessão preservada)...');
+    try {
+        await page.waitForURL(/sso\.acesso\.gov\.br|escolhaPerfil|home/, { timeout: 6000 });
+    } catch (e) {
+        // Continua na tela de login
     }
 
-    if (!fgtsdLoginCookie) throw new Error('Falha ao obter o cookie fgtsd_login do navegador.');
+    if (page.url().includes('/login')) {
+        console.log('[LOGIN] Passo 2: Clicando em "Entrar com gov.br"...');
+        const seletoresEntrar = [
+            'button:has-text("Entrar com gov.br")',
+            'a:has-text("Entrar com gov.br")',
+            '.br-button.sign-in',
+            'button[title*="gov.br"]'
+        ];
 
-    console.log('[LOGIN] SUCESSO EXTREMO! Sessão capturada com sucesso!');
+        let entrouGov = false;
+        for (const sel of seletoresEntrar) {
+            try {
+                const btn = page.locator(sel).first();
+                await btn.waitFor({ state: 'visible', timeout: 3000 });
+                await btn.click({ force: true });
+                entrouGov = true;
+                break;
+            } catch (e) {}
+        }
+
+        if (!entrouGov) {
+            console.log('[LOGIN] Tentando clicar no botão via injeção de JavaScript...');
+            entrouGov = await page.evaluate(() => {
+                const btns = Array.from(document.querySelectorAll('button, a'));
+                const alvo = btns.find(b => b.innerText && b.innerText.toLowerCase().includes('entrar com gov.br'));
+                if (alvo) { alvo.click(); return true; }
+                return false;
+            });
+        }
+
+        if (!entrouGov) {
+            console.log(`[LOGIN-ERRO] Botão de "Entrar com gov.br" não encontrado. Tirando foto da tela...`);
+            await page.screenshot({ path: path.join(process.cwd(), `erro-entrar-${Date.now()}.png`), fullPage: true });
+            throw new Error('Não foi possível clicar no botão de Entrar com gov.br na tela inicial.');
+        }
+
+        console.log('[LOGIN] Aguardando a tela do Gov.br ou o redirecionamento...');
+        await page.waitForURL(/sso\.acesso\.gov\.br|escolhaPerfil|home/, { timeout: 30000 });
+    }
+
+    if (page.url().includes('sso.acesso.gov.br')) {
+        console.log(`[LOGIN] Passo 3: Estamos no Gov.br. Clicando no botão do certificado digital...`);
+        const seletoresCertificado = [
+            '#login-certificate',
+            'button >> text="Seu certificado digital"',
+            'button >> text="Certificado digital"',
+            'img[alt*="Certificado"]'
+        ];
+
+        let btnClicado = false;
+        for (const sel of seletoresCertificado) {
+            try {
+                const element = page.locator(sel).first();
+                await element.waitFor({ state: 'visible', timeout: 10000 });
+                await element.click({ force: true });
+                btnClicado = true;
+                console.log(`[LOGIN] ✅ Botão de certificado clicado com sucesso usando: ${sel}`);
+                break;
+            } catch (e) {}
+        }
+
+        if (!btnClicado) {
+            console.log(`[LOGIN-ERRO] Nenhum botão de certificado foi encontrado. Tirando screenshot...`);
+            await page.screenshot({ path: path.join(process.cwd(), `erro-login-gov-${Date.now()}.png`), fullPage: true });
+            throw new Error('Não foi possível encontrar o botão de Certificado Digital na tela do Gov.br.');
+        }
+
+        console.log('[LOGIN] Passo 4: Aguardando o retorno para o FGTS (Se pedir Captcha, resolva!)...');
+        await page.waitForURL(/escolhaPerfil|home/, { timeout: 180000 });
+        console.log('[LOGIN] SUCESSO! Voltamos para o FGTS Digital com a sessão confiável!');
+    } else {
+        console.log('[LOGIN] ✅ SESSÃO REAPROVEITADA! Passamos direto pelo login do Gov.br!');
+    }
+
+    console.log('[LOGIN] Passo 5: Aguardando a tela de Seleção de Perfil...');
+    
+    await page.waitForURL(/escolhaPerfil|home/, { timeout: 30000 }).catch(() => {});
+    
+    if (page.url().includes('escolhaPerfil')) {
+        console.log(`[LOGIN] Tela de perfil detectada! Modo Procurador = ${isProcurador}`);
+        
+        await page.waitForTimeout(3000); 
+        
+        if (isProcurador) {
+            console.log(`[LOGIN] Selecionando 'Procurador' e buscando CNPJ ${cnpjDesejado}...`);
+            
+            const radioVelho = page.locator('input[value="PROCURADOR_PJ"]');
+            if (await radioVelho.count() > 0) {
+                await radioVelho.first().click({ force: true }).catch(()=>{});
+            } else {
+                console.log(`[LOGIN] Usando injeção de teclado para trocar para Procurador no novo menu...`);
+                const dropdown = page.locator('text="Meu Perfil"').last();
+                await dropdown.click({ force: true }).catch(()=>{});
+                await page.waitForTimeout(1000);
+                
+                await page.keyboard.type('Procurador');
+                await page.waitForTimeout(500);
+                await page.keyboard.press('Enter');
+            }
+            
+            await page.waitForTimeout(1000); 
+            const inputCnpj = page.locator('input[name="cnpjPj"], input[placeholder*="CNPJ"], input[aria-label*="CNPJ"], input[formcontrolname*="cnpj"]');
+            await inputCnpj.first().waitFor({ state: 'visible', timeout: 5000 }).catch(()=>{});
+            await inputCnpj.first().fill(cnpjDesejado).catch(()=>{});
+            
+        } else {
+            console.log(`[LOGIN] Modo 'Meu Perfil'. Como já é o padrão no modal, apenas confirmaremos...`);
+            const radioProprio = page.locator('input[value="MEU_PERFIL"]');
+            if (await radioProprio.count() > 0) {
+                await radioProprio.first().click({ force: true }).catch(()=>{});
+            }
+        }
+
+        await page.waitForTimeout(2000); 
+
+        console.log(`[LOGIN] Clicando no botão para confirmar o perfil (Procurando botão Definir)...`);
+        const seletoresConfirmar = [
+            'button:has-text("Definir")',
+            'button:has-text("Selecionar")',
+            'button:has-text("Continuar")'
+        ];
+
+        let clicouPerfil = false;
+        for (const sel of seletoresConfirmar) {
+            try {
+                const btn = page.locator(sel).first();
+                await btn.waitFor({ state: 'visible', timeout: 10000 });
+                await btn.evaluate(node => node.click());
+                clicouPerfil = true;
+                console.log(`[LOGIN] ✅ Botão de perfil clicado com sucesso usando injeção em: ${sel}`);
+                break;
+            } catch (e) {}
+        }
+
+        if (!clicouPerfil) {
+            console.log(`[LOGIN-ERRO] Não encontrou o botão de confirmar o perfil (timeout)! Tirando foto...`);
+            await page.screenshot({ path: path.join(process.cwd(), `erro-perfil-${Date.now()}.png`), fullPage: true });
+        } else {
+            console.log(`[LOGIN] Perfil confirmado. Aguardando carregamento do Dashboard (/home)...`);
+            await page.waitForTimeout(2000); 
+            await page.waitForURL(/home/, { timeout: 15000 }).catch(() => console.log('[LOGIN] Timeout secundário esperando /home, mas o clique foi feito.'));
+        }
+
+    } else {
+        console.log('[LOGIN] Tela de perfil não apareceu, o sistema entrou direto no Dashboard principal.');
+    }
+
+    const urlFgtsCode = page.url();
+
+    console.log('[LOGIN] Passo 6: Aguardando o portal FGTS trocar o Token em background...');
+    try {
+        await page.waitForResponse(response => 
+            response.url().includes('/api/v1/acessogov/token') && response.status() === 200, 
+            { timeout: 15000 }
+        );
+        console.log('[LOGIN] Token capturado pelo navegador com sucesso!');
+    } catch (e) {
+        console.log('[LOGIN] Aviso: O interceptador do token deu timeout, mas vamos checar os cookies mesmo assim.');
+    }
+
+    await page.waitForTimeout(3000); 
 
     const finalCookies = await context.cookies();
     const jar = newCookieJar();
     jar.set(finalCookies.map(c => `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}`));
 
-    await browser.close();
+    const pages = context.pages();
+    for (const p of pages) await p.close();
+    await context.close();
     if (cleanupFiles) await cleanupFiles();
     
+    console.log('[LOGIN] Cookies extraídos! Configurando sessão para chamadas de API (RPA)...');
     const headersApiFgts = {
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': page.url(),
+        'Referer': urlFgtsCode,
         'Origin': 'https://fgtsdigital.sistema.gov.br'
     };
 
-    return { jar, headersApiFgts };
+    return { jar, finalUrl: urlFgtsCode, headersApiFgts };
 
   } catch (error) {
     console.error('[LOGIN-ERRO]', error.message);
-    if (browser) await browser.close().catch(() => {});
+    if (context) {
+        const pages = context.pages();
+        for (const p of pages) await p.close().catch(()=>{});
+        await context.close().catch(() => {});
+    }
     if (cleanupFiles) await cleanupFiles().catch(() => {});
     throw error;
   }
 }
 
 app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
-  const { cnpj, pfxBase64, password, payloadBusca } = req.body
+  const { cnpj, cnpjCertificado, pfxBase64, password, payloadBusca } = req.body
   if (!cnpj) return res.status(400).json({ success: false, erro: 'CNPJ obrigatório' })
+  
+  const isProcurador = cnpj !== cnpjCertificado;
+
   try {
-    const { jar, headersApiFgts } = await loginGovBr(pfxBase64, password)
+    const { jar, headersApiFgts } = await getCachedOrLogin(cnpj, pfxBase64, password, isProcurador)
+    
     const cnpjNum = cnpj.replace(/\D/g,'')
     const empId = `${cnpjNum.substring(0,8)}1`
     console.log(`[FGTS-RPA] Consultando guias para o Empregador ${empId}...`)
@@ -211,6 +420,12 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
     const respUsuario = await httpRequest('https://fgtsdigital.sistema.gov.br/cobranca/api/usuario', { method:'GET', jar, headers: headersApiFgts })
     const dadosUsuario = tryParseJson(respUsuario.body)
     
+    if (respUsuario.status === 401 || respUsuario.status === 403) {
+        console.log(`[CACHE] Sessão do CNPJ ${cnpj} expirou no servidor do FGTS ou perfil não aplicado corretamente. Limpando cache...`);
+        sessionCache.delete(cnpj);
+        return res.status(401).json({ success: false, errorType: 'SESSION_EXPIRED', error: 'Sessão expirada ou sem permissão de procurador. Tente forçar novo login.' });
+    }
+
     let competencias = null;
     const respComp = await httpRequest(`https://fgtsdigital.sistema.gov.br/consignado/api/empregadores/${empId}/competencias`, { method:'GET', jar, headers: headersApiFgts })
     if (respComp.status === 200) competencias = tryParseJson(respComp.body)
@@ -237,10 +452,14 @@ app.post('/rpa/fgts/extrato', requireApiKey, async (req, res) => {
 });
 
 app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
-  const { cnpj, pfxBase64, password } = req.body
+  const { cnpj, cnpjCertificado, pfxBase64, password } = req.body
   if (!cnpj) return res.status(400).json({ success: false, erro: 'CNPJ obrigatório' })
+  
+  const isProcurador = cnpj !== cnpjCertificado;
+
   try {
-    const { jar, headersApiFgts } = await loginGovBr(pfxBase64, password)
+    const { jar, headersApiFgts } = await getCachedOrLogin(cnpj, pfxBase64, password, isProcurador)
+    
     console.log(`[FGTS-RPA] Extraindo Vínculos para o CNPJ ${cnpj}...`)
     const statuses = ['ativo', 'afastado', 'desligado']
     const todosEmpregados = []
@@ -248,6 +467,13 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
     for (const st of statuses) {
         const urlVinculos = `https://fgtsdigital.sistema.gov.br/extrato/api/vinculos/${st}/,,,,0,0?num-pagina=1&tam-pagina=1000&campo-ordem=nmTrabalhador&ordem=asc`
         const resp = await httpRequest(urlVinculos, { method: 'GET', jar, headers: headersApiFgts })
+        
+        if (resp.status === 401 || resp.status === 403) {
+            console.log(`[CACHE] Sessão do CNPJ ${cnpj} expirou no servidor do FGTS. Limpando cache...`);
+            sessionCache.delete(cnpj);
+            return res.status(401).json({ success: false, errorType: 'SESSION_EXPIRED', error: 'Sessão expirada. Tente forçar novo login.' });
+        }
+
         if (resp.status === 200) {
             const dados = tryParseJson(resp.body)
             const lista = dados?.content || dados?.itens || dados || []
@@ -262,4 +488,4 @@ app.post('/rpa/fgts/empregados', requireApiKey, async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }))
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Bridge FGTS Digital RPA rodando na
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Bridge FGTS Digital RPA rodando na porta ${PORT} (0.0.0.0)`))
