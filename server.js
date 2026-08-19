@@ -154,16 +154,16 @@ async function loginGovBr(pfxBase64, password, cnpjDesejado, isProcurador) {
     const certData = await convertPfxToPem(pfxBase64, password);
     cleanupFiles = certData.cleanup;
     
-    // DETECÇÃO DE SISTEMA OPERACIONAL (Para rodar no Windows ou Linux sem alterar o código)
+    // DETECÇÃO DE SISTEMA OPERACIONAL
     const isWindows = process.platform === 'win32';
     
-    // Caminho da pasta de cache adaptada
+    // APONTANDO PARA O SEU PERFIL REAL DO CHROME NO WINDOWS
     const userDataDir = isWindows 
-        ? path.join(process.cwd(), 'chrome-profile-rpa') 
-        : '/home/ubuntu/chrome-profile-rpa';
+        ? path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
+        : '/home/ubuntu/.config/google-chrome';
     
     // Caminho do Chrome Oficial adaptado
-    let chromePath = '/usr/bin/google-chrome'; // Padrão Linux
+    let chromePath = '/usr/bin/google-chrome';
     if (isWindows) {
         const path1 = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
         const path2 = 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe';
@@ -171,31 +171,34 @@ async function loginGovBr(pfxBase64, password, cnpjDesejado, isProcurador) {
         catch { chromePath = path2; }
     }
     
-    context = await chromium.launchPersistentContext(userDataDir, {
-      headless: false, // Mantido falso para você VER o robô rodando localmente
-      executablePath: chromePath, 
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      ignoreHTTPSErrors: true,
-      viewport: { width: 1280, height: 720 },
-      args: [
-        '--no-sandbox', 
-        '--disable-setuid-sandbox', 
-        '--disable-dev-shm-usage', 
-        '--disable-blink-features=AutomationControlled',
-        '--disable-web-security',
-        '--keep-alive-for-test', 
-        '--restore-last-session'
-      ],
-      clientCertificates: [{
-        origin: 'https://sso.acesso.gov.br', 
-        certPath: certData.certPath,
-        keyPath: certData.keyPath
-      }, {
-        origin: 'https://certificado.sso.acesso.gov.br',
-        certPath: certData.certPath,
-        keyPath: certData.keyPath
-      }]
-    });
+    try {
+      context = await chromium.launchPersistentContext(userDataDir, {
+        headless: false, // Abre visível para você ver
+        executablePath: chromePath, 
+        viewport: null, // Usa o tamanho real da sua tela
+        ignoreDefaultArgs: ['--enable-automation'], // ESCONDE O AVISO DE "SOFTWARE AUTOMATIZADO" NO TOPO!
+        args: [
+          '--start-maximized', // Abre o Chrome em tela cheia como você faria normalmente
+          '--restore-last-session'
+        ],
+        clientCertificates: [{
+          origin: 'https://sso.acesso.gov.br', 
+          certPath: certData.certPath,
+          keyPath: certData.keyPath
+        }, {
+          origin: 'https://certificado.sso.acesso.gov.br',
+          certPath: certData.certPath,
+          keyPath: certData.keyPath
+        }]
+      });
+    } catch (launchErr) {
+      if (launchErr.message.includes('lock') || launchErr.message.includes('EBUSY')) {
+          console.error('\n🔴 ATENÇÃO: ERRO DE PERFIL TRANCADO!');
+          console.error('Como estamos usando o seu perfil oficial com a sua conta Google, você precisa FECHAR TODAS as janelas do Chrome antes de disparar o robô!\n');
+          throw new Error('Feche todas as abas e janelas do Chrome e tente novamente.');
+      }
+      throw launchErr;
+    }
     
     const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
     page.setDefaultTimeout(180000); 
@@ -385,7 +388,7 @@ async function loginGovBr(pfxBase64, password, cnpjDesejado, isProcurador) {
     const headersApiFgts = {
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
+        // Removido o User-Agent fixo aqui também, para ele mandar o mesmo que o seu navegador normal mandaria
         'Referer': urlFgtsCode,
         'Origin': 'https://fgtsdigital.sistema.gov.br'
     };
