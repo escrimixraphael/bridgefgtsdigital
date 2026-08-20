@@ -1,1 +1,3 @@
 # bridgefgtsdigital
+ngrok config add-authtoken 3I8uHhoOmUECQRduoa2KjxeTOdN_3wxcPcG9A5rdDRaG6ibos
+ngrok http 10000
